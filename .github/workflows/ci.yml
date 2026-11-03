@@ -18,8 +18,12 @@ jobs:
         run: |
           node --check bridge/pz-bridge.mjs
           node --check bridge/llm.mjs
+          node --check bridge/config.mjs
       - name: Validate package.json
         run: node -e "JSON.parse(require('fs').readFileSync('bridge/package.json','utf8'))"
+      - name: Test isolated bridge configuration and runtime
+        working-directory: bridge
+        run: node --test
 
   mod:
     name: Mod (Lua) sanity

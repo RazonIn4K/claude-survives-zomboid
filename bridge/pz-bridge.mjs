@@ -9,17 +9,18 @@
 
 import http from 'node:http';
 import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
-import { fileURLToPath } from 'node:url';
 import { callLLM, BACKEND, MODEL } from './llm.mjs';
+import { loadBridgeConfig } from './config.mjs';
 
-const DIR = path.dirname(fileURLToPath(import.meta.url));
-const PORT = 8799;
-const LUA_DIR = path.join(os.homedir(), 'Zomboid', 'Lua');
-const PERCEPT_FILE = path.join(LUA_DIR, 'claude_percept.json');
-const INTENT_FILE = path.join(LUA_DIR, 'claude_intent.txt');   // B42 mod reads this (no HTTP-GET in mod Lua)
-const STATE_FILE = path.join(DIR, 'pz-state.json');
+let config;
+try {
+  config = loadBridgeConfig();
+} catch (error) {
+  console.error(`pz-bridge configuration error: ${error.message}`);
+  process.exit(1);
+}
+const { host: HOST, port: PORT, perceptFile: PERCEPT_FILE,
+  intentFile: INTENT_FILE, stateFile: STATE_FILE } = config;
 
 // atomic write so the game never getFileReader's a half-written line
 function writeIntentFile(line) {
@@ -292,7 +293,8 @@ http.createServer((req, res) => {
     return res.end(MIND_HTML);
   }
   res.writeHead(404); res.end();
-}).listen(PORT, () => {
-  log('boot', `pz-bridge up on http://localhost:${PORT}/mind — brain: ${BACKEND} (${MODEL}) — percept from ${PERCEPT_FILE}`);
+}).listen(PORT, HOST, function () {
+  const address = this.address();
+  log('boot', `pz-bridge up on http://${address.address}:${address.port}/mind — brain: ${BACKEND} (${MODEL}) — percept from ${PERCEPT_FILE}`);
   readPercept();
 });

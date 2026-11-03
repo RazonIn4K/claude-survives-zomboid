@@ -5,7 +5,8 @@
   "type": "module",
   "main": "pz-bridge.mjs",
   "scripts": {
-    "start": "node pz-bridge.mjs"
+    "start": "node pz-bridge.mjs",
+    "test": "node --test"
   },
   "bin": {
     "pz-bridge": "pz-bridge.mjs"

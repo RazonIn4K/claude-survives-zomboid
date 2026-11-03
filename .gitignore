@@ -4,6 +4,9 @@ npm-debug.log*
 
 # Bridge runtime state (per-run, machine-local)
 bridge/pz-state.json
+.env
+.env.*
+!.env.example
 *.log
 
 # OS / editor

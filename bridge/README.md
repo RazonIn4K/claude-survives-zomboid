@@ -1,10 +1,10 @@
 # The bridge (the brain)
 
-`pz-bridge.mjs` reads the game's perception, asks an LLM what to do, writes the decision back, and serves the live mind dashboard at `http://localhost:8799/mind`. `llm.mjs` is the pluggable backend.
+`pz-bridge.mjs` reads the game's perception, asks an LLM what to do, writes the decision back, and serves the live mind dashboard at `http://127.0.0.1:8799/mind`. The HTTP listener binds explicitly to IPv4 loopback (`127.0.0.1`). `llm.mjs` is the pluggable backend.
 
 ```bash
 node pz-bridge.mjs
-# → pz-bridge up on http://localhost:8799/mind — brain: <backend> (<model>) …
+# → pz-bridge up on http://127.0.0.1:8799/mind — brain: <backend> (<model>) …
 ```
 
 ## Choose your AI
@@ -39,7 +39,7 @@ OPENAI_API_KEY=sk-or-… OPENAI_BASE_URL=https://openrouter.ai/api/v1 PZ_MODEL=m
 GEMINI_API_KEY=… PZ_MODEL=gemini-1.5-flash node pz-bridge.mjs
 ```
 
-On Windows PowerShell, set vars with `$env:NAME="value"` before `node pz-bridge.mjs`. See [`.env.example`](.env.example).
+On Windows PowerShell, set vars with `$env:NAME="value"` before `node pz-bridge.mjs`. See [`.env.example`](.env.example). The bridge reads the process environment; it does not automatically load `.env` files. Local `.env` files are ignored by Git.
 
 ## Tuning
 
@@ -47,12 +47,35 @@ On Windows PowerShell, set vars with `$env:NAME="value"` before `node pz-bridge.
 |-----|---------|------|
 | `PZ_MODEL` | per-backend | The model to use. |
 | `PZ_TIMEOUT` | `45000` | Per-decision timeout (ms). Bump it for slow local models. |
-| `PORT` (in file) | `8799` | Dashboard + intent port. |
+| `PZ_PORT` | `8799` | Dashboard + intent port on `127.0.0.1`. Integer `0`–`65535`; `0` asks the OS for an available port, printed on startup. |
+| `PZ_LUA_DIR` | `~/Zomboid/Lua` | Directory containing `claude_percept.json` and `claude_intent.txt`. Explicit overrides must already exist. |
+| `PZ_STATE_FILE` | `pz-state.json` next to the script | Persistent memory and log file. Its parent directory must already exist; the file is created when state is saved. |
 
 **Speed matters.** The whole loop is more fun when decisions land in a few seconds. Small/fast models (Haiku, GPT-4o-mini, Gemini Flash, an 8B Ollama model) feel great. Big models are smarter but slower — the local reflex keeps the survivor alive either way, so favor speed.
 
 ## What it writes
 
-- Reads `~/Zomboid/Lua/claude_percept.json` (the game's senses).
-- Writes `~/Zomboid/Lua/claude_intent.txt` (the decision the mod executes).
-- `pz-state.json` (next to the script) — the AI's persistent memory + decision log across restarts. Safe to delete for a clean slate.
+- Reads `claude_percept.json` in `PZ_LUA_DIR` (the game's senses).
+- Writes `claude_intent.txt` in that same directory (the decision the mod executes).
+- Writes `PZ_STATE_FILE` — the AI's persistent memory + decision log across restarts. Safe to delete for a clean slate.
+
+Relative override paths resolve from the directory where you launch Node. Use absolute paths for launchers, and use `$HOME` in your shell rather than a literal `~` inside a quoted path. Blank paths, invalid ports, and a state file that overlaps the percept/intent files are rejected before the bridge starts. The default Lua directory may be absent until Project Zomboid's first launch; the bridge does not create it.
+
+## Isolated development runs
+
+Give each bridge its own Lua directory, state file, and port. For example, from `bridge/` on macOS/Linux:
+
+```bash
+mkdir -p "$PWD/scratch/run-a/Lua"
+PZ_BACKEND=ollama \
+  PZ_LUA_DIR="$PWD/scratch/run-a/Lua" \
+  PZ_STATE_FILE="$PWD/scratch/run-a/pz-state.json" \
+  PZ_PORT=8800 \
+  node pz-bridge.mjs
+```
+
+This only changes the bridge's paths. To connect a real game instance, its mod must write and read the same directory. These options do not add multiplayer, dedicated-server authority, or coordination between survivors. Without a percept file, this isolated bridge waits and makes no model requests.
+
+## Local tests
+
+Run `npm test` from `bridge/`. No package installation is needed. Tests use Node's built-in runner, temporary directories, synthetic game data, and a fake Ollama endpoint on an OS-assigned loopback port. They do not launch the game or a provider CLI, inherit API keys, or contact a real model service. The runtime smoke test takes about ten seconds because it preserves the bridge's normal decision cadence.
