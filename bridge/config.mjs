@@ -25,6 +25,46 @@ function checkPath(name, value, kind, allowMissing = false) {
   }
 }
 
+function statIfPresent(value, options) {
+  try {
+    return fs.statSync(value, options);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+// Resolve links in existing ancestors even when the final IPC file is not created
+// yet. An unresolved final symlink is ambiguous, so fail without writing through it.
+function canonicalPath(value) {
+  try {
+    return fs.realpathSync(value);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    try {
+      if (fs.lstatSync(value).isSymbolicLink()) {
+        throw new Error(`Cannot resolve dangling symlink: ${value}.`);
+      }
+    } catch (linkError) {
+      if (linkError.code !== 'ENOENT') throw linkError;
+    }
+    return path.join(canonicalPath(path.dirname(value)), path.basename(value));
+  }
+}
+
+function fileIdentity(value) {
+  return { canonical: canonicalPath(value), stat: statIfPresent(value, { bigint: true }) };
+}
+
+function aliases(left, right) {
+  // Reserve the IPC names case-insensitively within a resolved directory, including
+  // before files exist on case-insensitive volumes. Existing hardlinks need inode checks.
+  if (path.dirname(left.canonical) === path.dirname(right.canonical)
+    && path.basename(left.canonical).toLowerCase() === path.basename(right.canonical).toLowerCase()) return true;
+  return left.stat !== null && right.stat !== null
+    && left.stat.dev === right.stat.dev && left.stat.ino === right.stat.ino;
+}
+
 /** Resolve and validate configuration without creating any game or state directories. */
 export function loadBridgeConfig(env = process.env, {
   homeDir = os.homedir(),
@@ -46,7 +86,9 @@ export function loadBridgeConfig(env = process.env, {
   checkPath('PZ_LUA_DIR', luaDir, 'directory', env.PZ_LUA_DIR === undefined);
   checkPath('PZ_STATE_FILE parent directory', path.dirname(stateFile), 'directory');
   checkPath('PZ_STATE_FILE', stateFile, 'file', true);
-  if ([perceptFile, intentFile, `${intentFile}.tmp`].includes(stateFile)) {
+  const stateIdentity = fileIdentity(stateFile);
+  if ([perceptFile, intentFile, `${intentFile}.tmp`]
+    .some(file => aliases(stateIdentity, fileIdentity(file)))) {
     throw new Error('PZ_STATE_FILE must be separate from the percept and intent files.');
   }
 

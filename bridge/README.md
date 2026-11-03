@@ -61,6 +61,8 @@ On Windows PowerShell, set vars with `$env:NAME="value"` before `node pz-bridge.
 
 Relative override paths resolve from the directory where you launch Node. Use absolute paths for launchers, and use `$HOME` in your shell rather than a literal `~` inside a quoted path. Blank paths, invalid ports, and a state file that overlaps the percept/intent files are rejected before the bridge starts. The default Lua directory may be absent until Project Zomboid's first launch; the bridge does not create it.
 
+Separation checks resolve directory/file symlinks and detect existing hardlinks. IPC filenames are reserved without regard to case inside the same resolved directory, even before those files exist. Dangling symlinks are rejected. These startup checks prevent accidental aliases; they do not protect against another process changing filesystem links after validation.
+
 ## Isolated development runs
 
 Give each bridge its own Lua directory, state file, and port. For example, from `bridge/` on macOS/Linux:

@@ -17,6 +17,19 @@ function fixture(t) {
   return { root, options };
 }
 
+function createLink(t, action) {
+  try {
+    action();
+    return true;
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOTSUP', 'ENOSYS'].includes(error.code)) {
+      t.skip(`Filesystem links are unavailable: ${error.code}`);
+      return false;
+    }
+    throw error;
+  }
+}
+
 test('defaults preserve the original paths without creating a game directory', t => {
   const { options } = fixture(t);
   const config = loadBridgeConfig({}, options);
@@ -93,4 +106,72 @@ test('state cannot overwrite percept, intent or the atomic intent temporary file
       PZ_STATE_FILE: path.join(options.cwd, name),
     }, options), /PZ_STATE_FILE must be separate/);
   }
+});
+
+test('state cannot share an IPC path through an aliased directory before the file exists', t => {
+  const { root, options } = fixture(t);
+  const alias = path.join(root, 'linked-lua');
+  if (!createLink(t, () => fs.symlinkSync(options.cwd, alias, 'dir'))) return;
+  for (const name of ['claude_percept.json', 'claude_intent.txt', 'claude_intent.txt.tmp']) {
+    const target = path.join(options.cwd, name);
+    assert.throws(() => loadBridgeConfig({ PZ_LUA_DIR: alias, PZ_STATE_FILE: target }, options),
+      /PZ_STATE_FILE must be separate/);
+    assert.equal(fs.existsSync(target), false);
+  }
+});
+
+test('state cannot alias an existing IPC file through a file symlink', t => {
+  const { root, options } = fixture(t);
+  for (const name of ['claude_percept.json', 'claude_intent.txt', 'claude_intent.txt.tmp']) {
+    const target = path.join(options.cwd, name);
+    const alias = path.join(root, `${name}.memory-link`);
+    fs.writeFileSync(target, 'synthetic IPC data');
+    if (!createLink(t, () => fs.symlinkSync(target, alias, 'file'))) return;
+    assert.throws(() => loadBridgeConfig({ PZ_LUA_DIR: options.cwd, PZ_STATE_FILE: alias }, options),
+      /PZ_STATE_FILE must be separate/);
+    assert.equal(fs.readFileSync(target, 'utf8'), 'synthetic IPC data');
+  }
+});
+
+test('state cannot alias an existing IPC file through a hardlink', t => {
+  const { root, options } = fixture(t);
+  for (const name of ['claude_percept.json', 'claude_intent.txt', 'claude_intent.txt.tmp']) {
+    const target = path.join(options.cwd, name);
+    const alias = path.join(root, `${name}.memory-link`);
+    fs.writeFileSync(target, 'synthetic IPC data');
+    if (!createLink(t, () => fs.linkSync(target, alias))) return;
+    assert.throws(() => loadBridgeConfig({ PZ_LUA_DIR: options.cwd, PZ_STATE_FILE: alias }, options),
+      /PZ_STATE_FILE must be separate/);
+    assert.equal(fs.readFileSync(target, 'utf8'), 'synthetic IPC data');
+  }
+});
+
+test('dangling state symlinks are rejected without creating their targets', t => {
+  const { root, options } = fixture(t);
+  const target = path.join(options.cwd, 'claude_percept.json');
+  const alias = path.join(root, 'dangling-memory');
+  if (!createLink(t, () => fs.symlinkSync(target, alias, 'file'))) return;
+  assert.throws(() => loadBridgeConfig({ PZ_LUA_DIR: options.cwd, PZ_STATE_FILE: alias }, options),
+    /dangling symlink/);
+  assert.equal(fs.existsSync(target), false);
+});
+
+test('IPC names are reserved without regard to case within the same resolved directory', t => {
+  const { options } = fixture(t);
+  for (const name of ['CLAUDE_PERCEPT.JSON', 'CLAUDE_INTENT.TXT', 'CLAUDE_INTENT.TXT.TMP']) {
+    assert.throws(() => loadBridgeConfig({
+      PZ_LUA_DIR: options.cwd, PZ_STATE_FILE: path.join(options.cwd, name),
+    }, options), /PZ_STATE_FILE must be separate/);
+  }
+});
+
+test('a directory symlink is valid when state is separate from all IPC files', t => {
+  const { root, options } = fixture(t);
+  const alias = path.join(root, 'linked-lua');
+  if (!createLink(t, () => fs.symlinkSync(options.cwd, alias, 'dir'))) return;
+  const stateFile = path.join(root, 'separate-memory.json');
+  const config = loadBridgeConfig({ PZ_LUA_DIR: alias, PZ_STATE_FILE: stateFile }, options);
+  assert.equal(config.luaDir, alias);
+  assert.equal(config.stateFile, stateFile);
+  assert.equal(fs.existsSync(stateFile), false);
 });

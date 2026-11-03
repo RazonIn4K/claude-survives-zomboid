@@ -7,13 +7,25 @@ on:
 
 jobs:
   bridge:
-    name: Bridge (Node) syntax + JSON
-    runs-on: ubuntu-latest
+    name: Bridge (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: 18
+          - os: ubuntu-latest
+            node: 20
+          - os: macos-latest
+            node: 26
+          - os: windows-latest
+            node: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
       - name: Syntax-check the bridge
         run: |
           node --check bridge/pz-bridge.mjs
