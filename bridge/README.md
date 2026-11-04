@@ -63,6 +63,26 @@ Relative override paths resolve from the directory where you launch Node. Use ab
 
 Separation checks resolve directory/file symlinks and detect existing hardlinks. IPC filenames are reserved without regard to case inside the same resolved directory, even before those files exist. Dangling symlinks are rejected. These startup checks prevent accidental aliases; they do not protect against another process changing filesystem links after validation.
 
+## Delayed decisions
+
+The bridge uses the percept file's modification time, not the time Node reads
+it, for its 15-second freshness limit. It checks current readable JSON before
+starting a decision and again immediately after the model returns, including a
+retry. A reply is discarded before changing the intent, sequence, goals, reply,
+or memory if its original senses have expired, the current percept is unreadable
+or stale, the survivor is dead, or the percept file was replaced. Unanswered
+dashboard guidance is retained for the next accepted decision. Raising
+`PZ_TIMEOUT` does not extend this freshness limit; a model that regularly takes
+longer than 15 seconds will have its decisions discarded.
+
+This guard is not a game-session or human-takeover protocol. The shipped Lua
+percept does not identify the world/character/session or report manual mode.
+An in-place file rewrite can therefore represent a different survivor without
+being recognized as one. A previously published intent also remains available
+for Lua to consume, and accepted movement can continue through Lua's momentum
+logic. Do not treat this change as safe multiplayer NPC control or a guarantee
+against commands resuming after manual takeover.
+
 ## Isolated development runs
 
 Give each bridge its own Lua directory, state file, and port. For example, from `bridge/` on macOS/Linux:

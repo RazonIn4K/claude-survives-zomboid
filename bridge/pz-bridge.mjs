@@ -1,7 +1,7 @@
 // pz-bridge.mjs — the brain half of "Claude plays Project Zomboid".
 //
 //   game mod  --writes-->  %USERPROFILE%/Zomboid/Lua/claude_percept.json
-//   game mod  --GET------>  http://127.0.0.1:8799/pz/intent   ("SEQ|ACTION|A|B|SAY")
+//   game mod  <--reads---  claude_intent.txt in the configured Lua directory
 //   you       --watch---->  http://localhost:8799/mind        (thoughts, vitals, log, GOD channel)
 //
 // Decision loop: read latest percept -> claude -p -> intent. Cadence tightens when zombies close in.
@@ -41,7 +41,7 @@ try { state = { ...state, ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) }; 
 const saveState = () => { try { fs.writeFileSync(STATE_FILE, JSON.stringify({ ...state, log: state.log.slice(-200) })); } catch {} };
 
 let percept = null;         // last parsed percept
-let perceptAt = 0;          // ms when it was read
+let perceptAt = 0;          // percept file modification time, capped at the current time
 let intentLine = '0|WAIT|0|0|';
 let lastThought = '(waking up…)';
 let lastAction = '-';
@@ -57,17 +57,33 @@ const log = (kind, text) => {
 };
 
 // ---------- percept reading ----------
-let perceptMtime = 0;
+const MAX_PERCEPT_AGE_MS = 15000;
+let perceptSource = null;  // filesystem identity, not a game/character session ID
 function readPercept() {
+  let fd;
   try {
-    const mt = fs.statSync(PERCEPT_FILE).mtimeMs;
-    if (mt === perceptMtime) return;            // game hasn't written since last read — senses not fresh
-    const raw = fs.readFileSync(PERCEPT_FILE, 'utf8');
+    fd = fs.openSync(PERCEPT_FILE, 'r');
+    const before = fs.fstatSync(fd);
+    if (!before.isFile()) return false;
+    const raw = fs.readFileSync(fd, 'utf8');
+    const after = fs.fstatSync(fd);
+    const current = fs.statSync(PERCEPT_FILE);
+    // A truncate/write or replacement during this read is not a coherent snapshot.
+    if (before.dev !== after.dev || before.ino !== after.ino ||
+        before.mtimeMs !== after.mtimeMs || before.size !== after.size ||
+        current.dev !== after.dev || current.ino !== after.ino ||
+        current.mtimeMs !== after.mtimeMs || current.size !== after.size) return false;
     const j = JSON.parse(raw);
+    if (!j || typeof j !== 'object' || Array.isArray(j) || typeof j.dead !== 'boolean') return false;
+    const age = Date.now() - after.mtimeMs;
+    if (age > MAX_PERCEPT_AGE_MS || age < -1000) return false;
     percept = j;
-    perceptMtime = mt;
-    perceptAt = Date.now();
-  } catch { /* partial write or not running — keep last good */ }
+    perceptSource = { dev: after.dev, ino: after.ino };
+    // Reading an old file must not make it fresh again, including on bridge startup.
+    perceptAt = Math.min(Date.now(), after.mtimeMs);
+    return true;
+  } catch { return false; /* keep last good for display, never for a new decision */ }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 setInterval(readPercept, 1000);
 
@@ -132,7 +148,7 @@ Reply STRICT JSON only, no prose outside it:
 
 async function decide() {
   if (inFlight) return;
-  if (!percept || Date.now() - perceptAt > 15000) { brainNote = 'no fresh percept (game running? mod enabled?)'; return; }
+  if (!percept || !readPercept() || Date.now() - perceptAt > MAX_PERCEPT_AGE_MS) { brainNote = 'no fresh percept (game running? mod enabled?)'; return; }
 
   if (percept.dead) {
     if (!eulogized) {
@@ -148,7 +164,15 @@ async function decide() {
 
   inFlight = true;
   brainNote = 'thinking…';
+  const decisionPerceptAt = perceptAt;
+  const decisionSource = perceptSource;
   const god = godQueue.splice(0);
+  const discard = reason => {
+    brainNote = `discarded model reply: ${reason}`;
+    log('discard', reason);
+    // Unanswered guidance belongs to the next decision that is actually accepted.
+    godQueue.unshift(...god);
+  };
   // Keep this SHORT — prompt length is the dominant latency cost. Your `memory` field is the
   // real continuity; the log is just the last few beats so you don't repeat yourself.
   const recent = state.log.filter(l => l.kind === 'decide' || l.kind === 'god' || l.kind === 'death').slice(-3)
@@ -171,6 +195,17 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     let out;
     try { out = grabJSON(await ccCall(prompt)); }
     catch (e1) { out = grabJSON(await ccCall(prompt)); }   // one retry — blips happen
+    // Inference (including its retry) may outlive the senses it used. Refresh from
+    // disk, not merely the one-second polling cache, before changing intent or memory.
+    const decisionAge = Date.now() - decisionPerceptAt;
+    if (decisionAge > MAX_PERCEPT_AGE_MS || decisionAge < -1000) {
+      discard('request percept expired during inference'); return;
+    }
+    if (!readPercept()) { discard('current percept is unreadable or stale'); return; }
+    if (percept.dead) { discard('survivor is dead'); return; }
+    if (perceptSource.dev !== decisionSource.dev || perceptSource.ino !== decisionSource.ino) {
+      discard('percept file was replaced during inference'); return;
+    }
     const a = out.action || { type: 'WAIT' };
     const type = ['MOVE', 'LOOT', 'EAT', 'DRINK', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(a.type) ? a.type : 'WAIT';
     const dx = Math.max(-40, Math.min(40, Math.round(Number(a.dx) || 0)));
