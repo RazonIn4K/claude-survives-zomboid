@@ -41,11 +41,11 @@ test('unresolved existing evidence prevents a gameplay model request',{timeout:4
   assert.equal(fs.existsSync(path.join(run.luaDir,'claude_intent.txt')),false);
 });
 
-test('water commands retain measured outcomes through the real bridge transport',{timeout:9000},async t=>{
-  await Promise.all(['DRINKTAP','FILLBOTTLE'].map(type=>t.test(type,async t=>{
+test('survival skills retain measured outcomes through the real bridge transport',{timeout:12000},async t=>{
+  await Promise.all(['DRINKTAP','FILLBOTTLE','BANDAGE'].map(type=>t.test(type,async t=>{
     const run=temporaryRun(t);const game=fakeGame(run,{water:{valid:true,sources:[{key:'100:100:0:0',reachable:true}],fillableVessels:[{key:'item:5',amount:0,capacity:2}]}});
     const origin={world:'fixture-world',actor:'0',session:'fixture-session'};
-    game.onIntent=()=>{game.state.actionOutcome={...origin,seq:1,action:type,status:'pending',phase:'approach'};};
+    game.onIntent=()=>{game.state.actionOutcome={...origin,seq:1,action:type,status:'pending',phase:type==='BANDAGE'?'bandage':'approach'};};
     const endpoint=await model(run,(_req,res)=>{
       reply(res,{action:{type}});
     });
@@ -56,12 +56,14 @@ test('water commands retain measured outcomes through the real bridge transport'
     assert.match(endpoint.calls[0].body.messages[0].content,/DRINKTAP.*FILLBOTTLE/s);
     game.state.actionOutcome={...origin,seq:1,action:type,status:'observed_effect',phase:'verify',
       sourceKey:'100:100:0:0',vesselKey:type==='FILLBOTTLE'?'item:5':'',
+      supplyKey:type==='BANDAGE'?'item:5':'',partIndex:type==='BANDAGE'?0:-1,bandaged:type==='BANDAGE',consumed:type==='BANDAGE',
       amountGain:type==='FILLBOTTLE'?2:0,thirstDrop:type==='DRINKTAP'?0.4:0};game.publish();
     const[code]=await processRun.exited;assert.equal(code,0);
     const state=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
     assert.equal(state.outcomes.length,1);assert.equal(state.outcomes[0].action,type);
     assert.equal(state.outcomes[0].sourceKey,'100:100:0:0');
     assert.equal(state.outcomes[0].amountGain,type==='FILLBOTTLE'?2:0);
+    if(type==='BANDAGE')assert.equal(state.outcomes[0].consumed,true);
     assert.equal(state.disarmObserved,true);
   })));
 });
@@ -345,6 +347,12 @@ test('dashboard exposes session limits and accepts only same-origin POST stop',{
   assert.equal(elements.get('water').innerHTML,undefined);
   assert.ok(elements.get('water').textContent.includes(payload));
   assert.match(elements.get('water').textContent,/Water check: incomplete.*supported sources: 1.*fillable vessels: 0/);
+  renderState.percept.treatment={valid:false,eligibleWounds:[{index:0}],supplies:[{key:'item:5'}]};
+  renderState.percept.actionOutcome={action:'BANDAGE',status:'unverified',detail:payload};
+  await runInNewContext(script[1],{document,fetch:async()=>({json:async()=>renderState}),setInterval:()=>0});
+  assert.equal(elements.get('treatment').innerHTML,undefined);
+  assert.match(elements.get('treatment').textContent,/Treatment check: incomplete.*supported wounds: 1.*clean supplies: 1/);
+  assert.ok(elements.get('treatment').textContent.includes(payload));
   assert.equal((await fetch(`${base}/control/stop`)).status,405);
   assert.equal((await fetch(`${base}/control/stop`,{method:'POST'})).status,403);
   assert.equal((await fetch(`${base}/control/stop`,{method:'POST',headers:{Origin:'https://untrusted.example'}})).status,403);

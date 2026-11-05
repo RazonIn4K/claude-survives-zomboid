@@ -54,7 +54,7 @@ screwdriver equip. A subsequent scripted check collected three food items and
 consumed one with an observed hunger reduction. Positive drinking and combat
 remain untested. See [the bounded lab results](../docs/LAB-PLAYTEST.md).
 
-`bodyRevision="water-1"` identifies the current body update. Renewed short
+`bodyRevision="care-1"` identifies the current body update. Renewed short
 leases can continue without an absolute body cutoff. LOOT ranks nearby
 safe edible food and pure clean water ahead of a single useful weapon fallback;
 it does not fill inventory with household clutter. Food checks match the official
@@ -113,6 +113,30 @@ These changes have offline fixtures, including the installed native Lua parent;
 actual multiplayer reconstruction, replication, ordinary permissions and
 mid-action interruption are still pending. Healing, persistent routes and
 general survival competence are not established.
+
+`treatment` lists eligible owned unbandaged bleeding scratches/cuts and five
+supported clean single-use supplies in the top-level inventory. `BANDAGE`
+applies one dressing through a distinct shared native `ISApplyBandage` subclass.
+Glass, bites, deep wounds, burns, fractures, bullets, stitches, busy medical
+targets and unknown body-part facts are refused. This does not add glass
+removal, stitching, infection treatment or general healing.
+
+The native medical action is freshly validated before server/SP completion,
+including exact patient/part and original item identity. Its one-shot latch
+prevents duplicate medical effects or supply consumption. Native healer locks
+are acquired only synchronously during completion, so delayed server cleanup
+does not erase a replacement healer's lock. Client callbacks retain the
+originating lease/task identity and preserve replacement queue/progress state.
+
+Treatment receipts require a matching positive-life dressing and the original
+supply detached from any container and absent from recursive inventory lookup,
+after Lua/native inactivity. A single effect is unverified. Failures after an
+enqueue attempt are unverified; blocked callbacks wait for settled observations.
+The client tolerates narrowly recognized partial replication for 1.5 seconds;
+server/SP mutation rules remain strict. A treatment task has a 30-second
+deadline. These behaviors have offline fixtures with the installed native Lua
+parent and a distinct constructor-only server reconstruction fixture; actual
+network encoding, replication and cancellation remain unverified.
 
 LOOT/EAT/DRINK publish `actionOutcome` with their original world/actor/session.
 `observed_effect` requires a new full-inventory item ID or the matching raw

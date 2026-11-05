@@ -119,8 +119,23 @@ Events={OnTick=event("tick"),OnKeyPressed=event("key"),OnMouseDown=event("mouse"
 require=function(name)
     assert(name=="ClaudeLabControl" or name=="ClaudeLootPolicy" or name=="ClaudeActionEvidence"
         or name=="ClaudeHealthFacts" or name=="ClaudeWindowPolicy" or name=="ClaudeWaterFacts"
-        or name=="ClaudeWaterSkill" or name=="TimedActions/ClaudeTakeWaterAction")
+        or name=="ClaudeWaterSkill" or name=="TimedActions/ClaudeTakeWaterAction"
+        or name=="ClaudeTreatmentFacts" or name=="ClaudeTreatmentSkill" or name=="TimedActions/ClaudeApplyBandageAction")
     if name=="ClaudeWaterFacts" then dofile(directory.."/../shared/ClaudeWaterFacts.lua")
+    elseif name=="ClaudeTreatmentFacts" then dofile(directory.."/../shared/ClaudeTreatmentFacts.lua")
+    elseif name=="TimedActions/ClaudeApplyBandageAction" then
+        -- Native medical mutation/server guards are exercised by the separate
+        -- action suite. This fixture connects the real body, facts and task.
+        ClaudeApplyBandageAction={new=function(_,p,other,item,part,doIt,supplyKey,partIndex)
+            return {kind="bandage",character=p,otherPlayer=other,item=item,bodyPart=part,
+                isValid=function(self)
+                    if self.claudeAuthorized==nil or self.claudeAuthorized()~=true then return false end
+                    if p~=other or doIt~=true then return false end
+                    local wound=ClaudeTreatmentFacts.inspectWound(p,part)
+                    local supply=ClaudeTreatmentFacts.inspectSupply(p,item)
+                    return wound.allowed and wound.index==partIndex and supply.allowed and supply.key==supplyKey
+                end}
+        end}
     elseif name=="TimedActions/ClaudeTakeWaterAction" then
         -- Only the custom native action is stubbed here. Its actual shared
         -- implementation/server transfer guards have their own separate suite.
@@ -157,14 +172,26 @@ local light={getDisplayName=function() return "fixture light" end,IsFood=functio
     getLightStrength=function() return 1 end,setActivated=function() effect("light") end}
 local inventoryItems, statValues, squares, walkAllowed, walkTarget = {light}, {}, {}, true, nil
 local nativeBusy, traversingWindow = false, false
+local medicalParts=nil
 local playerPosition,waterReach={x=100.5,y=100.5,z=0},true
 ClimbThroughWindowState={instance=function() return "fixture-window-state" end}
-local inventory={getItems=function() return vector(inventoryItems) end}
+local inventory={getItems=function() return vector(inventoryItems) end,
+    getItemById=function(_,id)
+        for _,item in ipairs(inventoryItems) do if item:getID()==id then return item end end
+    end}
+light.getContainer=function() return inventory end
+light.getType=function() return "Light" end
+light.getFullType=function() return "Base.Light" end
+light.getModule=function() return "Base" end
 player={getX=function() return playerPosition.x end,getY=function() return playerPosition.y end,getZ=function() return playerPosition.z end,
     getStats=function() return {get=function(_,stat) return statValues[stat] or 0 end} end,isDead=function() return false end,
-    getOnlineID=function() return 0 end,isOutside=function() return false end,
+    getOnlineID=function() return 0 end,getUsername=function() return "fixture-user" end,isOutside=function() return false end,
     getCurrentState=function() return traversingWindow and "fixture-window-state" or "fixture-idle-state" end,
-    getBodyDamage=function() return {getOverallBodyHealth=function() return 100 end} end,
+    getBodyDamage=function()
+        local damage={getOverallBodyHealth=function() return 100 end}
+        if medicalParts then damage.getBodyParts=function() return vector(medicalParts) end end
+        return damage
+    end,
     getInventory=function() return inventory end,isKnownPoison=function(_,item) return item.poison or false end,
     getSquare=function() return {getRoom=function() return nil end} end,getPrimaryHandItem=function() return nil end,
     Say=function() effect("say") end,setSneaking=function() effect("sneak") end,
@@ -258,6 +285,7 @@ local function freshBody()
     files, handlers, queue, effects, zombies = {}, {}, {}, {}, {}
     inventoryItems, statValues, squares, walkAllowed, walkTarget = {light}, {}, {}, true, nil
     nativeBusy, traversingWindow = false, false
+    medicalParts=nil
     playerPosition,waterReach={x=100.5,y=100.5,z=0},true
     Events={OnTick=event("tick"),OnKeyPressed=event("key"),OnMouseDown=event("mouse"),OnRightMouseDown=event("right"),
         OnGameStart=event("start"),OnCreatePlayer=event("create")}
@@ -387,7 +415,11 @@ end
 local function outcome(field)
     local value=assert(files["claude_percept.json"]):match('"actionOutcome":({.-})')
     assert(value,"body did not serialize an action outcome")
-    return value:match('"'..field..'":"([^"]*)"') or tonumber(value:match('"'..field..'":([%d%.%-]+)'))
+    local text=value:match('"'..field..'":"([^"]*)"')
+    if text~=nil then return text end
+    if value:find('"'..field..'":true',1,true) then return true end
+    if value:find('"'..field..'":false',1,true) then return false end
+    return tonumber(value:match('"'..field..'":([%d%.%-]+)'))
 end
 bodyTest("loot prefers farther clean water over nearest junk and queues each item once",function()
     stocked(101,100,{fixtureItem(10,"Junk")})
@@ -510,7 +542,7 @@ end
 bodyTest("water observations and capabilities describe the prepared narrow skills",function()
     tap(101,100);waterVessel(70,0,1);advance(60)
     local text=assert(files["claude_percept.json"])
-    assert(text:find('"bodyRevision":"water-1"',1,true))
+    assert(text:find('"bodyRevision":"care-1"',1,true))
     assert(text:find('"tapDrinking":"safe_local_piped_only"',1,true))
     assert(text:find('"bottleFilling":"owned_compatible_vessel"',1,true))
     assert(text:find('"water":{',1,true) and text:find('"key":"101:100:0:0"',1,true))
@@ -593,5 +625,145 @@ bodyTest("later inventory action supersedes a completed water outcome",function(
     inventoryItems[#inventoryItems+1]=fixtureItem(73,"Food");statValues[CharacterStat.HUNGER]=0.5
     command("EAT",2);advance(60)
     assert(outcome("seq")==2 and outcome("action")=="EAT" and outcome("status")=="pending")
+end)
+
+local function medicalBody()
+    BodyPartType={MAX=17,ToIndex=function(kind) return kind end,
+        ToString=function(kind) return kind==0 and "Hand_L" or "Part_"..kind end}
+    medicalParts={}
+    for index=0,16 do
+        local id=index
+        local part={dressed=false,bleeds=id==0,cut=id==0,glass=false,life=0,dressingType=nil}
+        function part:getParentChar() return player end
+        function part:getIndex() return id end
+        function part:getType() return id end
+        function part:HasInjury() return self.bleeds or self.cut or self.glass end
+        function part:bleeding() return self.bleeds end
+        function part:scratched() return false end
+        function part:isCut() return self.cut end
+        function part:deepWounded() return false end
+        function part:bitten() return false end
+        function part:haveGlass() return self.glass end
+        function part:haveBullet() return false end
+        function part:stitched() return false end
+        function part:isBurnt() return false end
+        function part:isSplint() return false end
+        function part:getBurnTime() return 0 end
+        function part:getFractureTime() return 0 end
+        function part:manipulatingUsername() return nil end
+        function part:bandaged() return self.dressed end
+        function part:getBandageLife() return self.life end
+        function part:getBandageType() return self.dressingType end
+        medicalParts[#medicalParts+1]=part
+    end
+    return medicalParts[1]
+end
+local function bandageSupply(id,kind)
+    local item={kind="InventoryItem",supplyType=kind or "Bandage",infected=false,container=inventory}
+    function item:getID() return id end
+    function item:getDisplayName() return self.supplyType end
+    function item:getType() return self.supplyType end
+    function item:getModule() return "Base" end
+    function item:getFullType() return "Base."..self.supplyType end
+    function item:getContainer() return self.container end
+    function item:getUses() return 1 end
+    function item:getBandagePower() return 4 end
+    function item:isCanBandage() return true end
+    function item:isInfected() return self.infected end
+    function item:getFluidContainer() return nil end
+    inventoryItems[#inventoryItems+1]=item
+    return item
+end
+local function consumeSupply(item)
+    for i,candidate in ipairs(inventoryItems) do if candidate==item then table.remove(inventoryItems,i);break end end
+    item.container=nil
+end
+local function dressed(part,kind)
+    part.dressed,part.bleeds,part.life,part.dressingType=true,false,4,kind or "Base.Bandage"
+end
+
+bodyTest("treatment observations advertise only supported self bandaging",function()
+    medicalBody();bandageSupply(80);advance(60)
+    local text=assert(files["claude_percept.json"])
+    assert(text:find('"bodyRevision":"care-1"',1,true))
+    assert(text:find('"injuryTreatment":"self_bandage_simple_bleeding"',1,true))
+    assert(text:find('"treatment":{',1,true) and text:find('"eligibleWounds":[{"index":0,"name":"Hand_L"}]',1,true))
+    assert(text:find('"key":"item:80"',1,true) and text:find('"fullType":"Base.Bandage"',1,true))
+end)
+bodyTest("BANDAGE connects native task and requires dressing plus exact supply consumption",function()
+    local part=medicalBody();local item=bandageSupply(81)
+    command("BANDAGE");advance(60)
+    assert(#queue==1 and queue[1].kind=="bandage" and queue[1].item==item and queue[1].bodyPart==part)
+    assert(outcome("action")=="BANDAGE" and outcome("status")=="pending" and outcome("partIndex")==0)
+    dressed(part);consumeSupply(item);queue={};advance(60)
+    assert(outcome("status")=="observed_effect" and outcome("bandaged")==true and outcome("consumed")==true)
+    assert(outcome("supplyKey")=="item:81" and outcome("session")==session)
+end)
+bodyTest("BANDAGE refuses dirty supplies and unsupported complex wounds",function()
+    local part=medicalBody();local item=bandageSupply(82);item.infected=true
+    command("BANDAGE");advance(60)
+    assert(#queue==0 and not effects.queue and outcome("status")=="no_effect")
+    item.infected=false;part.glass=true;command("BANDAGE",2);advance(60)
+    assert(#queue==0 and not effects.queue and outcome("status")=="no_effect")
+end)
+bodyTest("empty medical queue alone does not claim treatment success",function()
+    medicalBody();bandageSupply(83);command("BANDAGE");queue={};advance(160)
+    assert(outcome("status")=="no_effect" and outcome("bandaged")==false and outcome("consumed")==false)
+end)
+bodyTest("dressing alone is insufficient medical completion evidence",function()
+    local part=medicalBody();bandageSupply(84);command("BANDAGE");dressed(part);queue={};advance(160)
+    assert(outcome("status")=="unverified" and outcome("bandaged")==true and outcome("consumed")==false)
+end)
+bodyTest("supply disappearance alone is insufficient medical completion evidence",function()
+    medicalBody();local item=bandageSupply(85);command("BANDAGE");consumeSupply(item);queue={};advance(160)
+    assert(outcome("status")=="unverified" and outcome("bandaged")==false and outcome("consumed")==true)
+end)
+bodyTest("different dressing type cannot claim the requested treatment succeeded",function()
+    local part=medicalBody();local item=bandageSupply(86);command("BANDAGE")
+    dressed(part,"Base.RippedSheets");consumeSupply(item);queue={};advance(160)
+    assert(outcome("status")=="unverified" and outcome("consumed")==true)
+end)
+bodyTest("manual takeover cancels medical work and invalidates its retained action",function()
+    medicalBody();bandageSupply(87);command("BANDAGE");local retained=assert(queue[1])
+    for _,fn in ipairs(handlers.mouse) do fn() end
+    advance(60)
+    assert(#queue==0 and outcome("status")=="interrupted" and retained:isValid()==false)
+    retained.claudeOnBlocked("late_retained_blocker");advance(60)
+    assert(outcome("status")=="interrupted" and outcome("session")==session and percept("session")~=session)
+end)
+bodyTest("old medical callback cannot finish a newer bandage task",function()
+    local part=medicalBody();local item=bandageSupply(88);command("BANDAGE");local old=assert(queue[1])
+    dressed(part);consumeSupply(item);queue={};advance(60)
+    medicalParts[2].bleeds,medicalParts[2].cut=true,true;bandageSupply(89)
+    command("BANDAGE",2);advance(60)
+    assert(outcome("seq")==2 and outcome("status")=="pending" and outcome("partIndex")==1)
+    old.claudeOnBlocked("late_old_failure");advance(60)
+    assert(outcome("seq")==2 and outcome("status")=="pending" and old:isValid()==false)
+end)
+bodyTest("medical receipt supersedes an older completed water result",function()
+    tap(101,100);statValues[CharacterStat.THIRST]=0.7;command("DRINKTAP")
+    queue={};statValues[CharacterStat.THIRST]=0.2;advance(60)
+    assert(outcome("status")=="observed_effect")
+    medicalBody();bandageSupply(90);command("BANDAGE",2);advance(60)
+    assert(outcome("seq")==2 and outcome("action")=="BANDAGE" and outcome("status")=="pending")
+end)
+bodyTest("later inventory receipt supersedes a completed medical result",function()
+    local part=medicalBody();local item=bandageSupply(91);command("BANDAGE")
+    dressed(part);consumeSupply(item);queue={};advance(60)
+    inventoryItems[#inventoryItems+1]=fixtureItem(92,"Food");statValues[CharacterStat.HUNGER]=0.5
+    command("EAT",2);advance(60)
+    assert(outcome("seq")==2 and outcome("action")=="EAT" and outcome("status")=="pending")
+end)
+bodyTest("native activity prevents medical success despite measured changes and an empty Lua queue",function()
+    local part=medicalBody();local item=bandageSupply(93);command("BANDAGE")
+    dressed(part);consumeSupply(item);queue={};nativeBusy=true;advance(60)
+    assert(outcome("status")=="pending")
+    nativeBusy=false;advance(60)
+    assert(outcome("status")=="observed_effect")
+end)
+bodyTest("moving a dressing item into another container is not consumption",function()
+    local part=medicalBody();local item=bandageSupply(94);command("BANDAGE")
+    dressed(part);consumeSupply(item);item.container={};queue={};advance(160)
+    assert(outcome("status")=="unverified" and outcome("consumed")==false)
 end)
 print("passed "..count.." lab Lua tests")

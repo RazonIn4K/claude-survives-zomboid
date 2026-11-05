@@ -167,6 +167,14 @@ test('water skills use supported identity-bound commands without movement parame
     assert.match(wire,/\|LAB1\|session-1\|world-1\|0\|test-token\|1000000\|1002000$/);
   }
 });
+test('self-bandaging uses one supported identity-bound command',()=>{
+  const lab=run();lab.bind(fixture());
+  const wire=lab.intent(fixture(),1,{type:'BANDAGE'});
+  assert.equal(wire.split('|')[1],'BANDAGE');
+  assert.equal(wire.split('|')[2],'0');assert.equal(wire.split('|')[3],'0');
+  assert.equal(wire.split('|').length,14);
+  assert.match(wire,/\|LAB1\|session-1\|world-1\|0\|test-token\|1000000\|1002000$/);
+});
 test('lifetime starts before first percept and cannot be extended by heartbeats',()=>{
   let time=1000000;
   const lab=new LabRun(labConfig({PZ_LAB_ARM:'1',PZ_MAX_SECONDS:'1'}),{now:()=>time,token:'test-token'});
@@ -188,5 +196,5 @@ test('Lua lab gate and actual body entry point enforce takeover',t=>{
   const result=spawnSync('lua',[script,directory],{encoding:'utf8',timeout:5000});
   if(result.error?.code==='ENOENT') { t.skip('Lua is not installed; gate engine stubs were not run.');return; }
   assert.equal(result.status,0,`${result.stdout}\n${result.stderr}`);
-  assert.match(result.stdout,/passed 42 lab Lua tests/);
+  assert.match(result.stdout,/passed 55 lab Lua tests/);
 });

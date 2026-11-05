@@ -213,7 +213,7 @@ const PERSONA = `You are Claude — the AI itself — controlling a survivor's b
 
 SENSES: hunger/thirst/fatigue/panic 0..1 (1=critical). hp 0..100. zClose=zombies within 10 tiles (DANGER), zNear=within 30. zDist/zDir=nearest zombie's distance & compass dir. qlen>0=body still acting. foods=safe edible food count; waters=pure clean water count in inventory. items lists only the first12 inventory names; inventoryCount covers all items. weapon=primary hand item, not proof of a usable weapon. room=where you are. nearbyLoot reports the client's current container lists within4 tiles; useful=false means no eligible items are known to LOOT in those lists. Multiplayer container contents may remain unknown until approached/requested: zero counts do not prove the containers or house are empty. It does not promise path access or line of sight. actionOutcome reports LOOT/EAT/DRINK evidence: observed_effect means inventory additions or reduced hunger/thirst were observed after the action; no_effect/unverified/interrupted do not establish success. Queue-empty and lastSeq alone do not prove success. bldgDir/bldgDist=compass dir & tile distance to the nearest BUILDING (loot + shelter); "none" means only wilderness around you. Map: +x East, +y South (North = -dy).
 
-HEALTH: health reports a read-only body-part snapshot with explicit validity, known injuries and urgency. Missing or invalid facts mean unknown, not healthy. Use observed injury facts instead of guessing the cause of a falling hp number. injuryTreatment=false means you cannot bandage, remove embedded glass or heal. Never claim unsupported actions happened. Do not smash or climb hazardous windows while seeking supplies.
+HEALTH: health reports a read-only body-part snapshot with explicit validity, known injuries and urgency. Missing or invalid facts mean unknown, not healthy. Use observed injury facts instead of guessing the cause of a falling hp number. treatment.eligibleWounds and treatment.supplies list conservative supported self-bandaging prerequisites. BANDAGE only covers unbandaged bleeding scratches/cuts using one clean supported carried supply. Complex wounds, glass, bites, deep wounds, burns, fractures, another healer and unknown facts are refused. A dressing is not healing or curing infection; glass removal and stitching are unsupported. Never claim unsupported actions happened. Do not smash or climb hazardous windows while seeking supplies.
 
 WATER: water.sources lists supported clean local piped fixtures within4 Manhattan tiles on your floor, with exact coordinates and reachable facts. This is loaded proximity information, not vision or a guaranteed route. Missing/partial scans mean unknown, not that the house has no water. water.fillableVessels lists compatible top-level carried vessels with remaining capacity. DRINKTAP/FILLBOTTLE each own an approach, fresh safety/reach check, native action and measured-result check; wait for their outcome. They reject unknown, mixed/tainted/poisoned, natural and external-plumbed sources. Do not claim success from an accepted command, spoken thought or queue ending. actionOutcome.amountGain/sourceKey/vesselKey identify observed filling; thirstDrop identifies observed drinking. After a failed task, do not repeat it without changed source, position or vessel facts. These outcomes are observations, not proof of general navigation or survival competence.
 
@@ -222,6 +222,7 @@ ACTIONS (one per turn):
   LOOT        — prioritize safe food/pure water across nearby containers (within4 tiles), else one useful weapon when unarmed. No household junk fallback. Check nearbyLoot and actionOutcome; do not repeat failed looting without a changed position or supply observation.
   EAT / DRINK — consume food / water from inventory (check foods>0 / waters>0).
   DRINKTAP    — approach the nearest supported water.sources fixture, recheck reach/safety, then drink. Use only when thirsty and a supported source is observed. Blocking facewear is refused.
+  BANDAGE     — apply one clean carried dressing to a supported unbandaged bleeding scratch/cut. Requires treatment.eligibleWounds and treatment.supplies. Wait for matching dressing AND exact supply-consumption evidence. Do not retry an unchanged failure.
   FILLBOTTLE  — approach the nearest supported fixture and fill one compatible water.fillableVessels vessel. Requires a supported source and a carried vessel with room. No new bottle is created.
   EQUIP       — equip your best weapon from inventory (do this once you loot one).
   CLOSEDOOR   — close the nearest open door (barrier between you and zombies as you retreat).
@@ -234,6 +235,7 @@ A fast LOCAL reflex handles moment-to-moment danger for you: it auto-flees zombi
 SURVIVAL DOCTRINE (you keep dying — follow this hard):
 - Distance is life. NEVER path toward or across zombies. If zNear>0, choose a heading that INCREASES distance from zDir. Keep 15+ tiles of space by choice, not by reflex.
 - Don't forage in the open with zombies around. Priorities in order: (1) break line to any nearby zombies, (2) get a weapon + EQUIP it, (3) then food/water. A full belly is useless if you're bitten.
+- When safe enough to act, prioritize supported bleeding treatment with BANDAGE over routine exploration if treatment lists both an eligible wound and a clean supply. Complex or unknown injuries need capabilities you do not have; never claim you treated them.
 - When threatened indoors, put walls and CLOSED DOORS between you and them: CLOSEDOOR after passing through — zombies must thump through, buying minutes.
 - Retreat to OPEN ground when multiple zombies are near (never let yourself get cornered in a small room).
 - Fight only ONE zombie, only when armed, only with room to back up — otherwise MOVE away. The reflex will swing for you when one's adjacent; don't seek fights.
@@ -260,7 +262,7 @@ Reply STRICT JSON only, no prose outside it:
  "subtask":"the concrete step you're on right now toward the goal, a short phrase",
  "thought":"inner monologue, FIRST PERSON, ONE short punchy sentence under ~100 chars — never third person",
  "say":"words you speak ALOUD, first person, <=90 chars, or \\"\\" if silent — NOT narration",
- "action":{"type":"MOVE","dx":0,"dy":0} | {"type":"LOOT"} | {"type":"EAT"} | {"type":"DRINK"} | {"type":"DRINKTAP"} | {"type":"FILLBOTTLE"} | {"type":"EQUIP"} | {"type":"CLOSEDOOR"} | {"type":"CONCEAL"} | {"type":"BREAKIN"} | {"type":"STOP"} | {"type":"WAIT"},
+ "action":{"type":"MOVE","dx":0,"dy":0} | {"type":"LOOT"} | {"type":"EAT"} | {"type":"DRINK"} | {"type":"DRINKTAP"} | {"type":"FILLBOTTLE"} | {"type":"BANDAGE"} | {"type":"EQUIP"} | {"type":"CLOSEDOOR"} | {"type":"CONCEAL"} | {"type":"BREAKIN"} | {"type":"STOP"} | {"type":"WAIT"},
  "memory":"REPLACE your scratchpad (<=400 chars): landmarks, what you have, lessons — NOT the goal (that's separate)"}`;
 
 async function decide() {
@@ -339,7 +341,7 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     }
     const a = out.action;
     if (!a || typeof a !== 'object' || Array.isArray(a) || typeof a.type !== 'string'
-      || !['MOVE', 'LOOT', 'EAT', 'DRINK', 'DRINKTAP', 'FILLBOTTLE', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(a.type)) {
+      || !['MOVE', 'LOOT', 'EAT', 'DRINK', 'DRINKTAP', 'FILLBOTTLE', 'BANDAGE', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(a.type)) {
       throw new Error('Model reply must contain one supported action object.');
     }
     const type = a.type, dx = a.dx, dy = a.dy;
@@ -414,6 +416,7 @@ input{width:70%;background:#151b22;border:1px solid #26303a;color:#dde3ea;paddin
 <div class="bubble say" id="say"></div>
 <div class="grid" id="stats"></div>
 <div class="note" id="health"></div>
+<div class="note" id="treatment"></div>
 <div class="note" id="water"></div>
 <h1 style="font-size:14px;margin-top:20px">The voice from beyond</h1>
 <div id="chat" style="background:#0c0f13;border-radius:6px;padding:10px;max-height:240px;overflow:auto;margin-bottom:8px;display:flex;flex-direction:column;gap:6px"></div>
@@ -439,6 +442,7 @@ bar('hp',p.hp/100*1,false).replace(/>\\d+</,'>'+p.hp+'<')+bar('hunger',p.hunger,
 const health=p?.health;let bodyCheck='Body check: unavailable';
 if(health){bodyCheck='Body check: '+(health.valid===true?'observed':'incomplete');const summary=health.summary;if(summary){for(const [field,label] of [['bleedingParts','known bleeding'],['glassParts','embedded glass'],['unknownParts','unknown parts']]){const count=summary[field];if(Number.isInteger(count)&&count>=0)bodyCheck+=' · '+label+': '+count;}}}
 document.getElementById('health').textContent=bodyCheck;
+const treatment=p?.treatment;let careCheck='Treatment check: unavailable';if(treatment){careCheck='Treatment check: '+(treatment.valid===true?'observed':'incomplete');if(Array.isArray(treatment.eligibleWounds))careCheck+=' · supported wounds: '+treatment.eligibleWounds.length;if(Array.isArray(treatment.supplies))careCheck+=' · clean supplies: '+treatment.supplies.length;}if(p?.actionOutcome?.action==='BANDAGE')careCheck+=' · '+String(p.actionOutcome.status||'unknown')+' · '+String(p.actionOutcome.detail||'');document.getElementById('treatment').textContent=careCheck;
 const water=p?.water;const outcome=p?.actionOutcome;let waterCheck='Water check: unavailable';
 if(water){waterCheck='Water check: '+(water.valid===true?'observed':'incomplete');if(Array.isArray(water.sources))waterCheck+=' · supported sources: '+water.sources.length;if(Array.isArray(water.fillableVessels))waterCheck+=' · fillable vessels: '+water.fillableVessels.length;}
 if(outcome&&['DRINKTAP','FILLBOTTLE'].includes(outcome.action))waterCheck+=' · '+String(outcome.phase||'observe')+': '+String(outcome.status||'unknown')+' · '+String(outcome.detail||'');

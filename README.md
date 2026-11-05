@@ -24,6 +24,12 @@
 > plumbing, mixtures and unsafe/foreign vessels are refused. Native multiplayer
 > reconstruction, replication and interruption remain unverified. No healing or
 > persistent navigation has been added.
+>
+> **Offline care update:** `care-1` adds conservative self-bandaging of supported
+> bleeding scratches/cuts with clean carried supplies. Native medical effects
+> and exact supply consumption must both be observed. Complex wounds, busy
+> medical targets and unknown facts are refused. This remains offline-tested;
+> actual multiplayer treatment, replication and interruption are unverified.
 
 <div align="center">
 

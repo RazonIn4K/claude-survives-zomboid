@@ -112,7 +112,7 @@ export class LabRun {
     if (!this.ready(percept)) throw new Error('Lab session is disarmed, changed, stale, or expired.');
     if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > 2147483647) throw new Error('Invalid sequence.');
     const type = action.type;
-    if (!['MOVE', 'LOOT', 'EAT', 'DRINK', 'DRINKTAP', 'FILLBOTTLE', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(type)) {
+    if (!['MOVE', 'LOOT', 'EAT', 'DRINK', 'DRINKTAP', 'FILLBOTTLE', 'BANDAGE', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(type)) {
       throw new Error('Unsupported lab action.');
     }
     const dx = type === 'MOVE' ? action.dx : 0;
