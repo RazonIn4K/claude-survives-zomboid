@@ -54,7 +54,7 @@ screwdriver equip. A subsequent scripted check collected three food items and
 consumed one with an observed hunger reduction. Positive drinking and combat
 remain untested. See [the bounded lab results](../docs/LAB-PLAYTEST.md).
 
-`bodyRevision="survival-1"` identifies the current body update. Renewed short
+`bodyRevision="water-1"` identifies the current body update. Renewed short
 leases can continue without an absolute body cutoff. LOOT ranks nearby
 safe edible food and pure clean water ahead of a single useful weapon fallback;
 it does not fill inventory with household clutter. Food checks match the official
@@ -86,6 +86,33 @@ queue. The guarded vanilla action rechecks controller identity/lease and live
 hazards before execution. Queue acceptance must be confirmed. Unsafe or unknown
 conditions return explicit blockers. These policies are source-reviewed and
 fixture-tested; actual multiplayer window execution remains unverified.
+
+`water` reports bounded loaded proximity facts for supported local piped
+sources and compatible top-level inventory vessels. It is not line-of-sight
+perception, a route map or evidence of fair normal-player sensing. Mixed,
+tainted, poisoned, external-plumbed, natural and unreadable sources are
+ineligible. Zero known sources in a partial scan does not establish absence.
+
+`DRINKTAP` and `FILLBOTTLE` own one approach, fresh reach/source/vessel checks,
+a distinct shared `ClaudeTakeWaterAction` derived from the native water action,
+and a result observation. The shared type rechecks before actual server fluid
+transfers; it does not replace vanilla actions or directly set thirst. Filling
+uses one carried compatible empty/pure-water vessel, with no item creation or
+foreign/nested inventory transfers. Drinking rejects blocking facewear rather
+than automatically removing equipment. Source keys are coordinates plus object
+index, not permanent global IDs. Vessels use item IDs plus object membership.
+
+Water receipts retain original world/actor/session, source/vessel keys, phase,
+raw thirst reduction and same-vessel clean-water amount gain. They wait for
+both Lua queue and native inactivity, then allow1.5 seconds for observations.
+An owned water task has a60-second deadline; this bounds one skill, not the
+continuous gameplay session. No measured delta, missing facts, interrupted
+control or timeout cannot be reported as success. Task callbacks cannot affect
+a replacement task, and stale cleanup preserves replacement vessel state.
+These changes have offline fixtures, including the installed native Lua parent;
+actual multiplayer reconstruction, replication, ordinary permissions and
+mid-action interruption are still pending. Healing, persistent routes and
+general survival competence are not established.
 
 LOOT/EAT/DRINK publish `actionOutcome` with their original world/actor/session.
 `observed_effect` requires a new full-inventory item ID or the matching raw

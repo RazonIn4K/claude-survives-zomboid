@@ -32,6 +32,8 @@ require "ClaudeLootPolicy"
 require "ClaudeActionEvidence"
 require "ClaudeHealthFacts"
 require "ClaudeWindowPolicy"
+require "ClaudeWaterFacts"
+require "ClaudeWaterSkill"
 local function readActionState(p)
   local count, nativeBusy, traversing = -1, nil, nil
   pcall(function()
@@ -46,6 +48,7 @@ local function readActionState(p)
   return count, nativeBusy, traversing
 end
 local actionEvidence = ClaudeActionEvidence.new()
+local waterSkill = ClaudeWaterSkill.new()
 local lab = ClaudeLabControl.new({
   now = function() return tonumber(getTimestampMs()) end,
   random = function() return ZombRand(1000000) end,
@@ -61,9 +64,11 @@ local lab = ClaudeLabControl.new({
   busy = function(p)
     local count, nativeBusy = readActionState(p)
     return count < 0 or nativeBusy ~= false or count > 0
+      or (waterSkill.receipt~=nil and waterSkill.receipt.status=="pending")
   end,
   stop = function(p)
     actionEvidence:cancel("control_revoked")
+    waterSkill:cancel("control_revoked")
     travel.active, travel.budget, observing = false, 0, false
     if not p then return false end
     local ok, empty = pcall(function()
@@ -276,6 +281,7 @@ local function buildPercept(p)
 
   local qlen, nativeBusy, traversing = readActionState(p)
   local health = ClaudeHealthFacts.read(p)
+  local water = ClaudeWaterFacts.read(p)
 
   local hour, day = 0, 0
   pcall(function() hour = getGameTime():getHour() end)
@@ -304,7 +310,7 @@ local function buildPercept(p)
   local j = '{'
   j = j .. '"dead":' .. tostring(p:isDead())
   j = j .. ',"labProtocol":1,"armed":' .. tostring(lab.armed)
-  j = j .. ',"bodyRevision":"survival-1"'
+  j = j .. ',"bodyRevision":"water-1"'
   j = j .. ',"session":"' .. esc(lab.session or "") .. '","world":"' .. esc(lab.world or "") .. '"'
   j = j .. ',"actor":"' .. esc(lab.actor or "") .. '","labToken":"' .. esc(lab.token or "") .. '"'
   j = j .. ',"observed_ms":' .. string.format("%.0f", tonumber(getTimestampMs()))
@@ -316,7 +322,8 @@ local function buildPercept(p)
   j = j .. ',"room":"' .. esc(room) .. '"'
   j = j .. ',"hp":' .. n2(hp)
   j = j .. ',"health":' .. ClaudeHealthFacts.toJSON(health)
-  j = j .. ',"capabilities":{"injuryObservation":true,"injuryTreatment":false,"windowSmash":false,"windowTraverse":"adjacent_safe_only","tapDrinking":false}'
+  j = j .. ',"capabilities":{"injuryObservation":true,"injuryTreatment":false,"windowSmash":false,"windowTraverse":"adjacent_safe_only","tapDrinking":"safe_local_piped_only","bottleFilling":"owned_compatible_vessel"}'
+  j = j .. ',"water":' .. ClaudeWaterFacts.toJSON(water)
   j = j .. ',"hunger":' .. n2(hunger) .. ',"thirst":' .. n2(thirst) .. ',"fatigue":' .. n2(fatigue)
   j = j .. ',"endurance":' .. n2(endurance) .. ',"panic":' .. n2(panic)
   j = j .. ',"zTotal":' .. zTotal .. ',"zNear":' .. zNear .. ',"zClose":' .. zClose
@@ -332,6 +339,7 @@ local function buildPercept(p)
   end
   j = j .. '}'
   local receipt = actionEvidence.receipt
+  if waterSkill.receipt and (not receipt or waterSkill.receipt.seq >= receipt.seq) then receipt=waterSkill.receipt end
   if receipt then
     j = j .. ',"actionOutcome":{"seq":' .. receipt.seq .. ',"action":"' .. esc(receipt.action)
       .. '","world":"' .. esc(receipt.world) .. '","actor":"' .. esc(receipt.actor)
@@ -339,6 +347,11 @@ local function buildPercept(p)
       .. '","status":"' .. esc(receipt.status) .. '","added":' .. (receipt.added or 0)
       .. ',"hungerDrop":' .. string.format("%.6f",receipt.hungerDrop or 0)
       .. ',"thirstDrop":' .. string.format("%.6f",receipt.thirstDrop or 0)
+      .. ',"amountGain":' .. string.format("%.6f",receipt.amountGain or 0)
+      .. ',"sourceKey":"' .. esc(receipt.sourceKey or "") .. '","vesselKey":"' .. esc(receipt.vesselKey or "")
+      .. '","phase":"' .. esc(receipt.phase or "") .. '"'
+      .. ',"beforeAmount":' .. (receipt.beforeAmount and string.format("%.6f",receipt.beforeAmount) or "null")
+      .. ',"afterAmount":' .. (receipt.afterAmount and string.format("%.6f",receipt.afterAmount) or "null")
       .. ',"detail":"' .. esc(receipt.detail) .. '"}'
   end
   j = j .. ',"bldgDir":"' .. bldgDir .. '","bldgDist":' .. bldgDist
@@ -385,6 +398,7 @@ end
 local function doMove(p, dx, dy)
   if not lab.armed then return end
   actionEvidence:cancel("movement_replaced_action")
+  waterSkill:cancel("movement_replaced_water_task")
   ISTimedActionQueue.clear(p)
   travel.active, travel.budget = false, 0
   stepWalk(p, dx, dy)
@@ -432,6 +446,26 @@ local function doLoot(p)
   HUD.action = "LOOT"
   HUD.thought = "Trying to collect: " .. table.concat(names, ", ")
 
+end
+
+-- A delayed native action is authorized only for its originating player and
+-- the currently renewed controller lease, never for a replacement session.
+local function bindAuthorization(p)
+  local ownerSession,ownerToken,ownerWorld,ownerActor,ownerSequence=lab.session,lab.token,lab.world,lab.actor,lab.lastSeq
+  local createdAt=tonumber(getTimestampMs())
+  return function()
+    return lab.armed and lab.player==p and getSpecificPlayer(0)==p
+      and lab.session==ownerSession and lab.token==ownerToken and lab.lastSeq==ownerSequence
+      and lab.world==ownerWorld and lab.actor==ownerActor
+      and tostring(getWorld():getWorld())==ownerWorld and tostring(p:getOnlineID())==ownerActor
+      and tonumber(getTimestampMs())>=createdAt and tonumber(getTimestampMs())<=lab.leaseUntil
+  end
+end
+
+local function doWater(p,seq,action)
+  local started,reason=waterSkill:start(p,seq,action,bindAuthorization(p),
+    {world=lab.world,actor=lab.actor,session=lab.session})
+  if not started then lastError="water: "..tostring(reason) end
 end
 
 -- close the nearest open door (buys time when fleeing indoors — zombies must thump through)
@@ -483,18 +517,9 @@ local function doBreakin(p)
     if win then break end
   end
   if not win then lastError = "breakin: " .. tostring(blocked); return end
-  local ownerSession, ownerToken, ownerWorld, ownerActor, ownerSequence = lab.session, lab.token, lab.world, lab.actor, lab.lastSeq
-  local createdAt = tonumber(getTimestampMs())
-  local function authorized()
-    return lab.armed and lab.player == p and getSpecificPlayer(0) == p
-      and lab.session == ownerSession and lab.token == ownerToken and lab.lastSeq == ownerSequence
-      and lab.world == ownerWorld and lab.actor == ownerActor
-      and tostring(getWorld():getWorld()) == ownerWorld and tostring(p:getOnlineID()) == ownerActor
-      and tonumber(getTimestampMs()) >= createdAt and tonumber(getTimestampMs()) <= lab.leaseUntil
-  end
   local queued, reason = ClaudeWindowPolicy.queue(p, win, nil, function(blocker)
     lastError = "breakin: " .. tostring(blocker)
-  end, authorized)
+  end, bindAuthorization(p))
   if not queued then lastError = "breakin: " .. tostring(reason or "window traversal refused") end
 end
 
@@ -549,6 +574,7 @@ local function execIntent(p, line)
   lastIntentRaw = line
   lastSeq, lastError = seq, ""
   local action = parts[2] or "WAIT"
+  waterSkill:cancel("superseded_by_"..action)
   local a, b = parts[3], parts[4]
   local say = parts[5] or ""
   local thought = parts[6] or ""
@@ -586,6 +612,7 @@ local function execIntent(p, line)
     end
   elseif action == "EAT" then travel.active = false; doEat(p)
   elseif action == "DRINK" then travel.active = false; doDrink(p)
+  elseif action == "DRINKTAP" or action == "FILLBOTTLE" then travel.active = false; doWater(p,seq,action)
   elseif action == "LOOT" then travel.active = false; doLoot(p)
   elseif action == "EQUIP" then travel.active = false; doEquip(p)
   elseif action == "CLOSEDOOR" then travel.active = false; doCloseDoor(p)
@@ -655,6 +682,7 @@ end
 -- longer just cowers: it stands its ground and kills manageable threats.
 local function engage(p, z, d)
   actionEvidence:cancel("combat_reflex_interrupted_action")
+  waterSkill:cancel("combat_reflex_interrupted_water_task")
   pcall(function() p:faceThisObject(z) end)
   if d <= 1.8 then
     pcall(function() p:DoAttack(0) end)          -- in range: swing
@@ -725,6 +753,7 @@ local function onTick()
   local active = lab:update(p)
   if not p then return end
   lastSeq = lab.lastSeq
+  waterSkill:update()
   if actionEvidence.receipt and actionEvidence.receipt.status == "pending" then
     local ok, qlen = pcall(function()
       local q = ISTimedActionQueue.getTimedActionQueue(p)

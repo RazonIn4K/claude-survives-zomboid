@@ -118,8 +118,24 @@ Events={OnTick=event("tick"),OnKeyPressed=event("key"),OnMouseDown=event("mouse"
     OnGameStart=event("start"),OnCreatePlayer=event("create")}
 require=function(name)
     assert(name=="ClaudeLabControl" or name=="ClaudeLootPolicy" or name=="ClaudeActionEvidence"
-        or name=="ClaudeHealthFacts" or name=="ClaudeWindowPolicy")
-    if name~="ClaudeLabControl" then dofile(directory.."/"..name..".lua") end
+        or name=="ClaudeHealthFacts" or name=="ClaudeWindowPolicy" or name=="ClaudeWaterFacts"
+        or name=="ClaudeWaterSkill" or name=="TimedActions/ClaudeTakeWaterAction")
+    if name=="ClaudeWaterFacts" then dofile(directory.."/../shared/ClaudeWaterFacts.lua")
+    elseif name=="TimedActions/ClaudeTakeWaterAction" then
+        -- Only the custom native action is stubbed here. Its actual shared
+        -- implementation/server transfer guards have their own separate suite.
+        ClaudeTakeWaterAction={new=function(_,p,item,source,sourceKey,vesselKey)
+            return {kind="takeWater",character=p,item=item,waterObject=source,
+                isValid=function(self)
+                    if self.claudeAuthorized and self.claudeAuthorized()~=true then return false end
+                    local fact=ClaudeWaterFacts.inspectSource(p,source,true)
+                    if not fact.allowed or fact.key~=sourceKey then return false end
+                    if item then local vessel=ClaudeWaterFacts.inspectVessel(p,item)
+                        return vessel.allowed and vessel.key==vesselKey end
+                    return true
+                end}
+        end}
+    elseif name~="ClaudeLabControl" then dofile(directory.."/"..name..".lua") end
 end
 ISUIElement={derive=function() return {} end}
 Keyboard={KEY_H=35}
@@ -133,16 +149,18 @@ getFileReader=function(name)
 end
 CharacterStat={HUNGER=1,THIRST=2,FATIGUE=3,ENDURANCE=4,PANIC=5}
 Fluid={Water="water"}
-instanceof=function(item,kind) return item and item.kind==kind or false end
+IsoFlagType={waterPiped="waterPiped",water="water",solidfloor="solidfloor"}
+instanceof=function(item,kind) return item and (item.kind==kind or (kind=="IsoObject" and item.isoObject==true)) or false end
 getGameTime=function() return {getHour=function() return 21 end,getNightsSurvived=function() return 0 end} end
 local light={getDisplayName=function() return "fixture light" end,IsFood=function() return false end,
     getID=function() return 1 end,getFluidContainer=function() return nil end,
     getLightStrength=function() return 1 end,setActivated=function() effect("light") end}
 local inventoryItems, statValues, squares, walkAllowed, walkTarget = {light}, {}, {}, true, nil
 local nativeBusy, traversingWindow = false, false
+local playerPosition,waterReach={x=100.5,y=100.5,z=0},true
 ClimbThroughWindowState={instance=function() return "fixture-window-state" end}
 local inventory={getItems=function() return vector(inventoryItems) end}
-player={getX=function() return 100.5 end,getY=function() return 100.5 end,getZ=function() return 0 end,
+player={getX=function() return playerPosition.x end,getY=function() return playerPosition.y end,getZ=function() return playerPosition.z end,
     getStats=function() return {get=function(_,stat) return statValues[stat] or 0 end} end,isDead=function() return false end,
     getOnlineID=function() return 0 end,isOutside=function() return false end,
     getCurrentState=function() return traversingWindow and "fixture-window-state" or "fixture-idle-state" end,
@@ -155,7 +173,12 @@ player={getX=function() return 100.5 end,getY=function() return 100.5 end,getZ=f
 getSpecificPlayer=function() return player end
 local function square(x,y,z,objects)
     return {getX=function() return x end,getY=function() return y end,getZ=function() return z end,
-        getObjects=function() return vector(objects or {}) end,getBuilding=function() return nil end}
+        getObjects=function() return vector(objects or {}) end,getBuilding=function() return nil end,
+        getRoom=function() return nil end,canReachTo=function() return waterReach end}
+end
+player.getCurrentSquare=function()
+    local x,y,z=math.floor(playerPosition.x),math.floor(playerPosition.y),math.floor(playerPosition.z)
+    return squares[x..":"..y..":"..z] or square(x,y,z)
 end
 getCell=function() return {getZombieList=function() return vector(zombies) end,
     getGridSquare=function(_,x,y,z) return squares[x..":"..y..":"..z] or square(x,y,z) end} end
@@ -174,7 +197,16 @@ luautils={walkAdj=function(p,target,keepActions)
     effect("walkAdj");walkTarget=target
     if not walkAllowed then return false end
     ISTimedActionQueue.add(ISWalkToTimedAction:new(p,target));return true
-end}
+end,
+    getCorrectSquareForWall=function(_,target) return target end,
+    walkAdjObject=function(p,source,allowDiagonal,keepActions)
+        assert(p==player and allowDiagonal==true and keepActions==true)
+        effect("walkAdjObject");walkTarget=source:getSquare()
+        if not walkAllowed then return false end
+        if ClaudeWaterFacts.inspectSource(p,source,true).allowed then return true end
+        ISTimedActionQueue.add({kind="waterApproach",isValid=function() return true end})
+        return true
+    end}
 getGameSpeed=function() return 1 end
 setGameSpeed=function() error("the lab must never change game speed") end
 dofile(directory.."/ClaudeSurvivor.lua")
@@ -226,6 +258,7 @@ local function freshBody()
     files, handlers, queue, effects, zombies = {}, {}, {}, {}, {}
     inventoryItems, statValues, squares, walkAllowed, walkTarget = {light}, {}, {}, true, nil
     nativeBusy, traversingWindow = false, false
+    playerPosition,waterReach={x=100.5,y=100.5,z=0},true
     Events={OnTick=event("tick"),OnKeyPressed=event("key"),OnMouseDown=event("mouse"),OnRightMouseDown=event("right"),
         OnGameStart=event("start"),OnCreatePlayer=event("create")}
     dofile(directory.."/ClaudeSurvivor.lua");tick()
@@ -433,5 +466,132 @@ bodyTest("reflex replacement interrupts partial loot and cannot later claim comp
     zombies={{getX=function() return 101 end,getY=function() return 100 end}}
     advance(5);zombies={};queue={};advance(100)
     assert(outcome("status")=="interrupted" and outcome("detail")=="movement_replaced_action")
+end)
+
+local function waterFluid(amount,capacity)
+    local fluid={amount=amount,capacity=capacity,pure=true,tainted=false,poisoned=false}
+    function fluid:getAmount() return self.amount end
+    function fluid:getCapacity() return self.capacity end
+    function fluid:isEmpty() return self.amount==0 end
+    function fluid:isPureFluid(kind) return kind==Fluid.Water and self.pure end
+    function fluid:isTainted() return self.tainted end
+    function fluid:isPoisonous() return self.poisoned end
+    function fluid:isInputLocked() return false end
+    function fluid:canAddFluid(kind) return kind==Fluid.Water end
+    return fluid
+end
+local function tap(x,y)
+    local objects={}
+    local target=square(x,y,0,objects)
+    local source={kind="IsoObject",isoObject=true,amount=10,external=false,tainted=false}
+    objects[1]=source;squares[x..":"..y..":0"]=target
+    function source:getSquare() return target end
+    function source:getObjectIndex() return 0 end
+    function source:getProperties() return {has=function(_,flag) return flag==IsoFlagType.waterPiped end} end
+    function source:getUsesExternalWaterSource() return self.external end
+    function source:getFluidAmount() return self.amount end
+    function source:hasFluid() return self.amount>0 end
+    function source:hasWater() return true end
+    function source:getPrimaryFluid() return Fluid.Water end
+    function source:isTaintedWater() return self.tainted end
+    function source:getFluidContainer() return self.fluid end
+    return source,target
+end
+local function waterVessel(id,amount,capacity)
+    local item={kind="WaterBottle",fluid=waterFluid(amount,capacity)}
+    function item:getID() return id end
+    function item:getDisplayName() return "fixture-water-vessel" end
+    function item:getContainer() return inventory end
+    function item:getFluidContainer() return self.fluid end
+    inventoryItems[#inventoryItems+1]=item
+    return item
+end
+
+bodyTest("water observations and capabilities describe the prepared narrow skills",function()
+    tap(101,100);waterVessel(70,0,1);advance(60)
+    local text=assert(files["claude_percept.json"])
+    assert(text:find('"bodyRevision":"water-1"',1,true))
+    assert(text:find('"tapDrinking":"safe_local_piped_only"',1,true))
+    assert(text:find('"bottleFilling":"owned_compatible_vessel"',1,true))
+    assert(text:find('"water":{',1,true) and text:find('"key":"101:100:0:0"',1,true))
+    assert(text:find('"key":"item:70"',1,true))
+end)
+bodyTest("tap drinking waits for approach then reports measured thirst change",function()
+    local source,target=tap(102,100)
+    statValues[CharacterStat.THIRST]=0.6
+    command("DRINKTAP");advance(60)
+    assert(#queue==1 and queue[1].kind=="waterApproach" and walkTarget==target,
+        "native drinking was queued before route completion")
+    assert(outcome("action")=="DRINKTAP" and outcome("status")=="pending")
+    queue={};playerPosition.x=101.5;advance()
+    assert(#queue==1 and queue[1].kind=="takeWater" and queue[1].waterObject==source and queue[1].item==nil)
+    queue={};statValues[CharacterStat.THIRST]=0.2;advance(60)
+    assert(outcome("status")=="observed_effect" and math.abs(outcome("thirstDrop")-0.4)<0.000001)
+    assert(outcome("sourceKey")=="102:100:0:0")
+end)
+bodyTest("bottle filling reports gain in the same clean inventory vessel",function()
+    local source=tap(101,100);local vessel=waterVessel(71,0.1,1)
+    command("FILLBOTTLE");advance(60)
+    assert(#queue==1 and queue[1].kind=="takeWater" and queue[1].waterObject==source and queue[1].item==vessel)
+    assert(outcome("status")=="pending" and outcome("vesselKey")=="item:71")
+    queue={};vessel.fluid.amount=1;advance(60)
+    assert(outcome("status")=="observed_effect" and math.abs(outcome("amountGain")-0.9)<0.000001)
+end)
+bodyTest("unsafe or unreadable tap water is refused without fake effects",function()
+    local source=tap(101,100);source.fluid=waterFluid(2,5);source.fluid.pure=false
+    statValues[CharacterStat.THIRST]=0.7
+    command("DRINKTAP");advance(60)
+    assert(#queue==0 and not effects.walkAdjObject and not effects.queue)
+    assert(outcome("status")=="no_effect" and outcome("thirstDrop")==0)
+    source.fluid=nil;source.getUsesExternalWaterSource=nil
+    command("DRINKTAP",2);advance(60)
+    assert(#queue==0 and not effects.queue and outcome("status")=="no_effect")
+end)
+bodyTest("source contamination during approach prevents a water action",function()
+    local source=tap(102,100);statValues[CharacterStat.THIRST]=0.7
+    command("DRINKTAP");assert(#queue==1 and queue[1].kind=="waterApproach")
+    source.fluid=waterFluid(2,5);source.fluid.poisoned=true
+    queue={};playerPosition.x=101.5;advance(60)
+    assert(#queue==0 and outcome("status")=="no_effect" and outcome("thirstDrop")==0)
+    assert(outcome("detail")=="water_source_mixed_tainted_or_poisoned")
+end)
+bodyTest("queue completion alone cannot claim drinking succeeded",function()
+    tap(101,100);statValues[CharacterStat.THIRST]=0.7
+    command("DRINKTAP");assert(#queue==1 and queue[1].kind=="takeWater")
+    queue={};advance(160)
+    assert(outcome("status")=="no_effect" and outcome("thirstDrop")==0)
+    assert(outcome("detail")=="water_queue_empty_without_measured_effect")
+end)
+bodyTest("manual takeover interrupts water and invalidates retained action authority",function()
+    tap(101,100);statValues[CharacterStat.THIRST]=0.7
+    command("DRINKTAP");assert(#queue==1 and queue[1].kind=="takeWater")
+    local retained=queue[1]
+    for _,fn in ipairs(handlers.mouse) do fn() end
+    advance(60)
+    assert(#queue==0 and outcome("status")=="interrupted" and retained:isValid()==false)
+    assert(outcome("session")==session and percept("session")~=session)
+    assert(files["claude_percept.json"]:find('"armed":false',1,true))
+end)
+bodyTest("failed approach never queues fallback consumption",function()
+    tap(102,100);walkAllowed=false;statValues[CharacterStat.THIRST]=0.7
+    command("DRINKTAP");advance(60)
+    assert(effects.walkAdjObject==1 and #queue==0 and not effects.queue)
+    assert(outcome("status")=="no_effect" and outcome("detail")=="water_approach_refused")
+end)
+bodyTest("new water outcome supersedes an older completed inventory action",function()
+    inventoryItems[#inventoryItems+1]=fixtureItem(72,"Food")
+    statValues[CharacterStat.HUNGER],statValues[CharacterStat.THIRST]=0.5,0.7
+    command("EAT");queue={};statValues[CharacterStat.HUNGER]=0.2;advance(60)
+    assert(outcome("seq")==1 and outcome("status")=="observed_effect")
+    tap(101,100);command("DRINKTAP",2);advance(60)
+    assert(outcome("seq")==2 and outcome("action")=="DRINKTAP" and outcome("status")=="pending")
+end)
+bodyTest("later inventory action supersedes a completed water outcome",function()
+    tap(101,100);statValues[CharacterStat.THIRST]=0.7
+    command("DRINKTAP");queue={};statValues[CharacterStat.THIRST]=0.2;advance(60)
+    assert(outcome("seq")==1 and outcome("status")=="observed_effect")
+    inventoryItems[#inventoryItems+1]=fixtureItem(73,"Food");statValues[CharacterStat.HUNGER]=0.5
+    command("EAT",2);advance(60)
+    assert(outcome("seq")==2 and outcome("action")=="EAT" and outcome("status")=="pending")
 end)
 print("passed "..count.." lab Lua tests")

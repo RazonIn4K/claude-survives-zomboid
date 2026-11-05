@@ -16,6 +16,14 @@
 > native-action busy state and conservative adjacent window traversal. BREAKIN
 > never smashes or walks to a window. These changes have fixture coverage and
 > source review; their actual multiplayer behavior still needs validation.
+>
+> **Offline water update:** the current `water-1` body adds `DRINKTAP` and
+> `FILLBOTTLE` for supported clean local piped fixtures. A task approaches,
+> rechecks actual reach and safety, queues a native server-driven action and
+> waits for measured thirst or same-vessel water changes. Unknown/external
+> plumbing, mixtures and unsafe/foreign vessels are refused. Native multiplayer
+> reconstruction, replication and interruption remain unverified. No healing or
+> persistent navigation has been added.
 
 <div align="center">
 

@@ -16,7 +16,7 @@ end
 local function identifier(value)
     return type(value) == "string" and #value > 0 and #value <= 180 and value:match("^[%w_%.:%-]+$")
 end
-local allowed = {MOVE=true, LOOT=true, EAT=true, DRINK=true, EQUIP=true,
+local allowed = {MOVE=true, LOOT=true, EAT=true, DRINK=true, DRINKTAP=true, FILLBOTTLE=true, EQUIP=true,
     CLOSEDOOR=true, CONCEAL=true, BREAKIN=true, STOP=true, WAIT=true}
 
 function ClaudeLabControl.new(env)

@@ -16,8 +16,8 @@ const clockFixture=fileURLToPath(new URL('../test-support/clock.cjs',import.meta
 test('pending evidence settles before cleanup and receipts retain their original identity',{timeout:8000},async t=>{
   const run=temporaryRun(t);const game=fakeGame(run);
   const origin={world:'fixture-world',actor:'0',session:'fixture-session'};
+  game.onIntent=()=>{game.state.actionOutcome={...origin,seq:1,action:'LOOT',status:'pending',added:0};};
   const endpoint=await model(run,(_req,res)=>{
-    game.state.actionOutcome={...origin,seq:1,action:'LOOT',status:'pending',added:0};game.publish();
     reply(res,{action:{type:'LOOT'}});
   });
   const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_REQUESTS:'1'});
@@ -39,6 +39,31 @@ test('unresolved existing evidence prevents a gameplay model request',{timeout:4
   const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_SECONDS:'1'});
   const[code]=await processRun.exited;assert.equal(code,0);assert.equal(endpoint.calls.length,0);
   assert.equal(fs.existsSync(path.join(run.luaDir,'claude_intent.txt')),false);
+});
+
+test('water commands retain measured outcomes through the real bridge transport',{timeout:9000},async t=>{
+  await Promise.all(['DRINKTAP','FILLBOTTLE'].map(type=>t.test(type,async t=>{
+    const run=temporaryRun(t);const game=fakeGame(run,{water:{valid:true,sources:[{key:'100:100:0:0',reachable:true}],fillableVessels:[{key:'item:5',amount:0,capacity:2}]}});
+    const origin={world:'fixture-world',actor:'0',session:'fixture-session'};
+    game.onIntent=()=>{game.state.actionOutcome={...origin,seq:1,action:type,status:'pending',phase:'approach'};};
+    const endpoint=await model(run,(_req,res)=>{
+      reply(res,{action:{type}});
+    });
+    const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_REQUESTS:'1'});
+    await boot(processRun);await waitFor(()=>game.state.lastSeq===1,()=>processRun.output());
+    const wire=fs.readFileSync(path.join(run.luaDir,'claude_intent.txt'),'utf8');
+    assert.equal(wire.split('|')[1],type);assert.equal(endpoint.calls.length,1);
+    assert.match(endpoint.calls[0].body.messages[0].content,/DRINKTAP.*FILLBOTTLE/s);
+    game.state.actionOutcome={...origin,seq:1,action:type,status:'observed_effect',phase:'verify',
+      sourceKey:'100:100:0:0',vesselKey:type==='FILLBOTTLE'?'item:5':'',
+      amountGain:type==='FILLBOTTLE'?2:0,thirstDrop:type==='DRINKTAP'?0.4:0};game.publish();
+    const[code]=await processRun.exited;assert.equal(code,0);
+    const state=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
+    assert.equal(state.outcomes.length,1);assert.equal(state.outcomes[0].action,type);
+    assert.equal(state.outcomes[0].sourceKey,'100:100:0:0');
+    assert.equal(state.outcomes[0].amountGain,type==='FILLBOTTLE'?2:0);
+    assert.equal(state.disarmObserved,true);
+  })));
 });
 
 test('busy or unreadable action state cannot start model work or claim verified cleanup',{timeout:7000,concurrency:true},async t=>{
@@ -94,6 +119,7 @@ function fakeGame(run,extras={}) {
         &&f[10]===game.state.actor&&f[11]===game.state.labToken&&Number(f[13])>now&&Number(f[0])>game.state.lastSeq) {
         game.state.lastSeq=Number(f[0]);
         if(f[1]==='MOVE'){game.state.x+=Number(f[2]);game.state.y+=Number(f[3]);}
+        game.onIntent?.(f);
       }
     }catch{}
     game.state.observed_ms=now;fs.writeFileSync(file,JSON.stringify(game.state));
@@ -205,6 +231,7 @@ test('unsafe context changes cannot publish a delayed model decision',{timeout:1
     ['world changes',(_run,game)=>{game.state.world='other-world';game.publish();}],
     ['percept file replaced',(_run,game)=>{fs.writeFileSync(game.file+'.new',JSON.stringify(game.state));fs.renameSync(game.file+'.new',game.file);}],
     ['body becomes busy during inference',(_run,game)=>{game.state.qlen=1;game.publish();}],
+    ['action evidence becomes pending during inference',(_run,game)=>{game.state.actionOutcome={seq:1,action:'DRINKTAP',status:'pending',phase:'verify'};game.publish();}],
     ['current percept unreadable',(_run,game)=>{game.paused=true;fs.writeFileSync(game.file,'{');}],
     ['current percept stale',(_run,game)=>{game.paused=true;const old=new Date(Date.now()-16000);fs.utimesSync(game.file,old,old);}],
   ];
@@ -301,6 +328,8 @@ test('dashboard exposes session limits and accepts only same-origin POST stop',{
   await fetch(`${base}/god?text=${encodeURIComponent(payload)}`);
   const renderState=await(await fetch(`${base}/api/state`)).json();
   renderState.percept.health={valid:false,summary:{bleedingParts:1,glassParts:0,unknownParts:2}};
+  renderState.percept.water={valid:false,sources:[{}],fillableVessels:[]};
+  renderState.percept.actionOutcome={action:'DRINKTAP',phase:'verify',status:'unverified',detail:payload};
   renderState.chat.push({from:'claude',text:payload,t:'<svg/onload=stopAI()>'});
   const elements=new Map();
   const document={getElementById(id){if(!elements.has(id))elements.set(id,{});return elements.get(id);}};
@@ -313,6 +342,9 @@ test('dashboard exposes session limits and accepts only same-origin POST stop',{
   assert.ok(rendered.includes('&lt;img src=x onerror=&quot;stopAI()&quot;&gt; &amp; &#39;quoted&#39;'));
   assert.ok(rendered.includes('&lt;svg/onload=stopAI()&gt;'));
   assert.match(elements.get('health').textContent,/Body check: incomplete.*known bleeding: 1.*unknown parts: 2/);
+  assert.equal(elements.get('water').innerHTML,undefined);
+  assert.ok(elements.get('water').textContent.includes(payload));
+  assert.match(elements.get('water').textContent,/Water check: incomplete.*supported sources: 1.*fillable vessels: 0/);
   assert.equal((await fetch(`${base}/control/stop`)).status,405);
   assert.equal((await fetch(`${base}/control/stop`,{method:'POST'})).status,403);
   assert.equal((await fetch(`${base}/control/stop`,{method:'POST',headers:{Origin:'https://untrusted.example'}})).status,403);

@@ -127,7 +127,7 @@ function readPercept() {
       if (key !== lastOutcomeKey) {
         lastOutcomeKey = key;
         state.outcomes = [...(state.outcomes || []), { ...outcome, observed_ms: j.observed_ms }].slice(-100);
-        log('outcome', `seq ${outcome.seq} ${outcome.action}: ${outcome.status}; added=${outcome.added || 0}, hungerDrop=${outcome.hungerDrop || 0}, thirstDrop=${outcome.thirstDrop || 0}`);
+        log('outcome', `seq ${outcome.seq} ${outcome.action}: ${outcome.status}; added=${outcome.added || 0}, hungerDrop=${outcome.hungerDrop || 0}, thirstDrop=${outcome.thirstDrop || 0}, waterGain=${outcome.amountGain || 0}; ${outcome.detail || ''}`);
         saveState();
       }
     }
@@ -213,12 +213,16 @@ const PERSONA = `You are Claude — the AI itself — controlling a survivor's b
 
 SENSES: hunger/thirst/fatigue/panic 0..1 (1=critical). hp 0..100. zClose=zombies within 10 tiles (DANGER), zNear=within 30. zDist/zDir=nearest zombie's distance & compass dir. qlen>0=body still acting. foods=safe edible food count; waters=pure clean water count in inventory. items lists only the first12 inventory names; inventoryCount covers all items. weapon=primary hand item, not proof of a usable weapon. room=where you are. nearbyLoot reports the client's current container lists within4 tiles; useful=false means no eligible items are known to LOOT in those lists. Multiplayer container contents may remain unknown until approached/requested: zero counts do not prove the containers or house are empty. It does not promise path access or line of sight. actionOutcome reports LOOT/EAT/DRINK evidence: observed_effect means inventory additions or reduced hunger/thirst were observed after the action; no_effect/unverified/interrupted do not establish success. Queue-empty and lastSeq alone do not prove success. bldgDir/bldgDist=compass dir & tile distance to the nearest BUILDING (loot + shelter); "none" means only wilderness around you. Map: +x East, +y South (North = -dy).
 
-HEALTH: health reports a read-only body-part snapshot with explicit validity, known injuries and urgency. Missing or invalid facts mean unknown, not healthy. Use observed injury facts instead of guessing the cause of a falling hp number. capabilities lists restrictions: injuryTreatment=false means you cannot bandage, remove embedded glass or heal; tapDrinking=false means DRINK still only consumes carried pure water. Never claim those unsupported actions happened. Do not smash or climb hazardous windows while seeking supplies.
+HEALTH: health reports a read-only body-part snapshot with explicit validity, known injuries and urgency. Missing or invalid facts mean unknown, not healthy. Use observed injury facts instead of guessing the cause of a falling hp number. injuryTreatment=false means you cannot bandage, remove embedded glass or heal. Never claim unsupported actions happened. Do not smash or climb hazardous windows while seeking supplies.
+
+WATER: water.sources lists supported clean local piped fixtures within4 Manhattan tiles on your floor, with exact coordinates and reachable facts. This is loaded proximity information, not vision or a guaranteed route. Missing/partial scans mean unknown, not that the house has no water. water.fillableVessels lists compatible top-level carried vessels with remaining capacity. DRINKTAP/FILLBOTTLE each own an approach, fresh safety/reach check, native action and measured-result check; wait for their outcome. They reject unknown, mixed/tainted/poisoned, natural and external-plumbed sources. Do not claim success from an accepted command, spoken thought or queue ending. actionOutcome.amountGain/sourceKey/vesselKey identify observed filling; thirstDrop identifies observed drinking. After a failed task, do not repeat it without changed source, position or vessel facts. These outcomes are observations, not proof of general navigation or survival competence.
 
 ACTIONS (one per turn):
   MOVE dx dy — one nonzero integer offset, radius <=4 tiles. No momentum or automatic continuation.
   LOOT        — prioritize safe food/pure water across nearby containers (within4 tiles), else one useful weapon when unarmed. No household junk fallback. Check nearbyLoot and actionOutcome; do not repeat failed looting without a changed position or supply observation.
   EAT / DRINK — consume food / water from inventory (check foods>0 / waters>0).
+  DRINKTAP    — approach the nearest supported water.sources fixture, recheck reach/safety, then drink. Use only when thirsty and a supported source is observed. Blocking facewear is refused.
+  FILLBOTTLE  — approach the nearest supported fixture and fill one compatible water.fillableVessels vessel. Requires a supported source and a carried vessel with room. No new bottle is created.
   EQUIP       — equip your best weapon from inventory (do this once you loot one).
   CLOSEDOOR   — close the nearest open door (barrier between you and zombies as you retreat).
   CONCEAL     — hunker down: close all nearby doors AND window curtains so you can't be seen from outside. Do this when holing up inside.
@@ -256,7 +260,7 @@ Reply STRICT JSON only, no prose outside it:
  "subtask":"the concrete step you're on right now toward the goal, a short phrase",
  "thought":"inner monologue, FIRST PERSON, ONE short punchy sentence under ~100 chars — never third person",
  "say":"words you speak ALOUD, first person, <=90 chars, or \\"\\" if silent — NOT narration",
- "action":{"type":"MOVE","dx":0,"dy":0} | {"type":"LOOT"} | {"type":"EAT"} | {"type":"DRINK"} | {"type":"EQUIP"} | {"type":"CLOSEDOOR"} | {"type":"CONCEAL"} | {"type":"BREAKIN"} | {"type":"STOP"} | {"type":"WAIT"},
+ "action":{"type":"MOVE","dx":0,"dy":0} | {"type":"LOOT"} | {"type":"EAT"} | {"type":"DRINK"} | {"type":"DRINKTAP"} | {"type":"FILLBOTTLE"} | {"type":"EQUIP"} | {"type":"CLOSEDOOR"} | {"type":"CONCEAL"} | {"type":"BREAKIN"} | {"type":"STOP"} | {"type":"WAIT"},
  "memory":"REPLACE your scratchpad (<=400 chars): landmarks, what you have, lessons — NOT the goal (that's separate)"}`;
 
 async function decide() {
@@ -281,7 +285,7 @@ async function decide() {
   if (!Number.isSafeInteger(percept.qlen) || percept.qlen < 0) { brainNote = 'waiting for a readable timed action queue'; return; }
   if (percept.nativeBusy !== false) { brainNote = 'waiting for native character action state'; return; }
   if (percept.qlen > 0) { brainNote = 'waiting for the current timed action queue'; return; }
-  if (percept.actionOutcome?.status === 'pending') { brainNote = 'waiting for inventory or needs evidence'; return; }
+  if (percept.actionOutcome?.status === 'pending') { brainNote = `waiting for action evidence (${percept.actionOutcome.phase || 'observe'})`; return; }
   if (!lab.beginRequest(percept)) { if (lab.stopped) void finishRun(lab.reason); return; }
 
   inFlight = true;
@@ -329,12 +333,13 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     const stopReason = autonomousStopReason(percept);
     if (stopReason) { await finishRun(stopReason); return; }
     if (percept.qlen !== 0 || percept.nativeBusy !== false) { discard('body became busy during inference'); return; }
+    if (percept.actionOutcome?.status === 'pending') { discard('an action outcome became pending during inference'); return; }
     if (perceptSource.dev !== decisionSource.dev || perceptSource.ino !== decisionSource.ino) {
       discard('percept file was replaced during inference'); return;
     }
     const a = out.action;
     if (!a || typeof a !== 'object' || Array.isArray(a) || typeof a.type !== 'string'
-      || !['MOVE', 'LOOT', 'EAT', 'DRINK', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(a.type)) {
+      || !['MOVE', 'LOOT', 'EAT', 'DRINK', 'DRINKTAP', 'FILLBOTTLE', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(a.type)) {
       throw new Error('Model reply must contain one supported action object.');
     }
     const type = a.type, dx = a.dx, dy = a.dy;
@@ -409,6 +414,7 @@ input{width:70%;background:#151b22;border:1px solid #26303a;color:#dde3ea;paddin
 <div class="bubble say" id="say"></div>
 <div class="grid" id="stats"></div>
 <div class="note" id="health"></div>
+<div class="note" id="water"></div>
 <h1 style="font-size:14px;margin-top:20px">The voice from beyond</h1>
 <div id="chat" style="background:#0c0f13;border-radius:6px;padding:10px;max-height:240px;overflow:auto;margin-bottom:8px;display:flex;flex-direction:column;gap:6px"></div>
 <p style="display:flex;gap:8px"><input id="god" placeholder="speak to him… (Enter to send)" onkeydown="if(event.key==='Enter')sendGod()" style="flex:1"><button onclick="sendGod()">send</button></p>
@@ -433,6 +439,10 @@ bar('hp',p.hp/100*1,false).replace(/>\\d+</,'>'+p.hp+'<')+bar('hunger',p.hunger,
 const health=p?.health;let bodyCheck='Body check: unavailable';
 if(health){bodyCheck='Body check: '+(health.valid===true?'observed':'incomplete');const summary=health.summary;if(summary){for(const [field,label] of [['bleedingParts','known bleeding'],['glassParts','embedded glass'],['unknownParts','unknown parts']]){const count=summary[field];if(Number.isInteger(count)&&count>=0)bodyCheck+=' · '+label+': '+count;}}}
 document.getElementById('health').textContent=bodyCheck;
+const water=p?.water;const outcome=p?.actionOutcome;let waterCheck='Water check: unavailable';
+if(water){waterCheck='Water check: '+(water.valid===true?'observed':'incomplete');if(Array.isArray(water.sources))waterCheck+=' · supported sources: '+water.sources.length;if(Array.isArray(water.fillableVessels))waterCheck+=' · fillable vessels: '+water.fillableVessels.length;}
+if(outcome&&['DRINKTAP','FILLBOTTLE'].includes(outcome.action))waterCheck+=' · '+String(outcome.phase||'observe')+': '+String(outcome.status||'unknown')+' · '+String(outcome.detail||'');
+document.getElementById('water').textContent=waterCheck;
 const chat=s.chat||[];const cbox=document.getElementById('chat');
 cbox.innerHTML=chat.map(function(m){var god=m.from==='god';
 return '<div style="align-self:'+(god?'flex-end':'flex-start')+';max-width:78%;background:'+(god?'#26303a':'#1c2733')+';border-left:3px solid '+(god?'#ffd479':'#7fd1b9')+';padding:6px 10px;border-radius:6px"><div style="font-size:10px;color:#8899aa;text-transform:uppercase">'+(god?'you':'him')+' · '+escapeHTML(m.t)+'</div>'+escapeHTML(m.text)+'</div>';}).join('');
