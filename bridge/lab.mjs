@@ -112,10 +112,30 @@ export class LabRun {
     if (!this.ready(percept)) throw new Error('Lab session is disarmed, changed, stale, or expired.');
     if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > 2147483647) throw new Error('Invalid sequence.');
     const type = action.type;
-    if (!['MOVE', 'LOOT', 'EAT', 'DRINK', 'DRINKTAP', 'FILLBOTTLE', 'BANDAGE', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(type)) {
+    if (!['MOVE', 'NAVIGATE', 'LOOT', 'EAT', 'DRINK', 'DRINKTAP', 'FILLBOTTLE', 'BANDAGE', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(type)) {
       throw new Error('Unsupported lab action.');
     }
-    const dx = type === 'MOVE' ? action.dx : 0;
+    let targetId = 0;
+    if (type === 'NAVIGATE') {
+      targetId = action.targetId;
+      const nav = percept.navigation;
+      if (!Number.isInteger(targetId) || targetId < 1 || targetId > 2147483647
+          || nav?.scope !== 'current_session' || nav.valid !== true || !same(nav, percept)
+          || !Array.isArray(nav.anchors) || nav.anchors.length > 24) {
+        throw new Error('NAVIGATE requires a current remembered destination ID.');
+      }
+      const ids = new Set();
+      for (const anchor of nav.anchors) {
+        if (!Number.isInteger(anchor?.id) || anchor.id < 1 || anchor.id > 2147483647 || ids.has(anchor.id)) {
+          throw new Error('Navigation destination identities are unreadable or duplicated.');
+        }
+        ids.add(anchor.id);
+      }
+      if (!nav.anchors.some(anchor => anchor.id === targetId && anchor.canNavigate === true)) {
+        throw new Error('NAVIGATE destination is unavailable in the current observation.');
+      }
+    }
+    const dx = type === 'MOVE' ? action.dx : (type === 'NAVIGATE' ? targetId : 0);
     const dy = type === 'MOVE' ? action.dy : 0;
     if (type === 'MOVE' && (!Number.isInteger(dx) || !Number.isInteger(dy) || dx*dx + dy*dy < 1 || dx*dx + dy*dy > 16)) {
       throw new Error('MOVE must be a nonzero integer offset within four tiles.');

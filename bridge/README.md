@@ -54,7 +54,7 @@ screwdriver equip. A subsequent scripted check collected three food items and
 consumed one with an observed hunger reduction. Positive drinking and combat
 remain untested. See [the bounded lab results](../docs/LAB-PLAYTEST.md).
 
-`bodyRevision="care-1"` identifies the current body update. Renewed short
+`bodyRevision="nav-1"` identifies the current body update. Renewed short
 leases can continue without an absolute body cutoff. LOOT ranks nearby
 safe edible food and pure clean water ahead of a single useful weapon fallback;
 it does not fill inventory with household clutter. Food checks match the official
@@ -137,6 +137,45 @@ server/SP mutation rules remain strict. A treatment task has a 30-second
 deadline. These behaviors have offline fixtures with the installed native Lua
 parent and a distinct constructor-only server reconstruction fixture; actual
 network encoding, replication and cancellation remain unverified.
+
+`navigation` contains visited-position facts from the current control-session
+namespace, not a discovered floor plan. It keeps at most 96 internal anchors,
+exposes at most 24 and does not reuse evicted IDs within a namespace. Origin
+means first observed position, not a safehouse. World/actor/session changes
+reset memory; there is no cross-reconnect restore. The bridge archives the
+latest public facts but never loads them back into live Lua memory or commands.
+
+`NAVIGATE` accepts `{"type":"NAVIGATE","targetId":7}` only for a current,
+available remembered ID. Wire parameters are the ID and zero, not coordinates.
+The body resolves the ID again. `canNavigate` is memory/range/cooldown
+eligibility, not physical route clearance. Failed routes have temporary
+30-second origin/target cooldowns; expiry is not proof a route became clear.
+
+Vanilla pathfinding can automatically open doors or climb windows/fences.
+This skill therefore requires a nonnil indoor room, safe loaded floors, matching
+raw/current-square coordinates, known bounded deferred movement and clear local
+edges before every native update, including the first path-ready frame. It also
+explicitly excludes the native wall/hoppable flags. Unsafe/unknown neighbors,
+room/floor changes, stairs, fire, glass, vehicles and exposed paths outside the
+supported region are refused. The task accepts destinations within 32 tiles;
+its current movement guard is deliberately restrictive near walls and entrances.
+These checks apply to NAVIGATE; other movement/approach skills retain their
+earlier limitations and do not inherit this route guard.
+
+Arrival requires measured raw position within 0.35 tiles on the target floor
+and known Lua/native inactivity. Native completion or an empty queue away from
+the goal is not arrival. Tasks have a 60-second deadline, a 10-second movement
+progress window and a 48-tile excursion limit. They do not automatically retry.
+Retained callbacks cannot cancel a replacement path or complete a newer task.
+If unrelated work is appended while navigation remains current, only its native
+path state is cancelled. The mixed queue is preserved and cleanup stays
+unverified; new navigation remains blocked until observed idle and may require
+manual handoff. Simultaneous queue writers are not a supported control mode.
+
+This slice has offline fixtures, including the installed vanilla path action.
+Real movement, collision semantics, replication and cancellation require a
+deliberate game session. Cross-room exploration, shelter selection and durable
+world memory remain future work.
 
 LOOT/EAT/DRINK publish `actionOutcome` with their original world/actor/session.
 `observed_effect` requires a new full-inventory item ID or the matching raw

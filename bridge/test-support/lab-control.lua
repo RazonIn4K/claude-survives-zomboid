@@ -41,6 +41,15 @@ test("movement bounds are checked without coercion",function()
     assert(not gate:accept(intent(1,"MOVE",0,0)))
     assert(gate:accept(intent(1,"MOVE",4,0)))
 end)
+test("navigation targets require a positive integer anchor ID and zero spare parameter",function()
+    arm()
+    for _,id in ipairs({0,-1,"1e0","1.5",2147483648}) do
+        assert(not gate:accept(intent(1,"NAVIGATE",id,0)),"invalid anchor ID was accepted")
+    end
+    assert(not gate:accept(intent(1,"NAVIGATE",1,1)),"navigation accepted an arbitrary second coordinate")
+    assert(gate.lastSeq==0)
+    assert(gate:accept(intent(1,"NAVIGATE",7,0)))
+end)
 test("manual takeover permanently revokes pending ARM and intent",function()
     arm(); local old=gate.session; local pending=intent(1,"MOVE",1,0)
     gate:manual(); assert(not gate.armed and gate.session~=old and stops==1)
@@ -120,7 +129,8 @@ require=function(name)
     assert(name=="ClaudeLabControl" or name=="ClaudeLootPolicy" or name=="ClaudeActionEvidence"
         or name=="ClaudeHealthFacts" or name=="ClaudeWindowPolicy" or name=="ClaudeWaterFacts"
         or name=="ClaudeWaterSkill" or name=="TimedActions/ClaudeTakeWaterAction"
-        or name=="ClaudeTreatmentFacts" or name=="ClaudeTreatmentSkill" or name=="TimedActions/ClaudeApplyBandageAction")
+        or name=="ClaudeTreatmentFacts" or name=="ClaudeTreatmentSkill" or name=="TimedActions/ClaudeApplyBandageAction"
+        or name=="ClaudePlaceMemory" or name=="ClaudeNavigationSkill" or name=="Vehicles/TimedActions/ISPathFindAction")
     if name=="ClaudeWaterFacts" then dofile(directory.."/../shared/ClaudeWaterFacts.lua")
     elseif name=="ClaudeTreatmentFacts" then dofile(directory.."/../shared/ClaudeTreatmentFacts.lua")
     elseif name=="TimedActions/ClaudeApplyBandageAction" then
@@ -150,6 +160,9 @@ require=function(name)
                     return true
                 end}
         end}
+    elseif name=="Vehicles/TimedActions/ISPathFindAction" then
+        -- Native path execution is stubbed only in this whole-body fixture.
+        -- The navigation task's own suite verifies the installed parent.
     elseif name~="ClaudeLabControl" then dofile(directory.."/"..name..".lua") end
 end
 ISUIElement={derive=function() return {} end}
@@ -165,6 +178,9 @@ end
 CharacterStat={HUNGER=1,THIRST=2,FATIGUE=3,ENDURANCE=4,PANIC=5}
 Fluid={Water="water"}
 IsoFlagType={waterPiped="waterPiped",water="water",solidfloor="solidfloor"}
+for _,name in ipairs({"HoppableW","HoppableN","TallHoppableW","TallHoppableN","WallW","WallN","WallWTrans","WallNTrans"}) do IsoFlagType[name]=name end
+IsoObjectType={MAX="fixture-no-stairs"}
+Vector2={new=function() return {length=0,getLength=function(self) return self.length end} end}
 instanceof=function(item,kind) return item and (item.kind==kind or (kind=="IsoObject" and item.isoObject==true)) or false end
 getGameTime=function() return {getHour=function() return 21 end,getNightsSurvived=function() return 0 end} end
 local light={getDisplayName=function() return "fixture light" end,IsFood=function() return false end,
@@ -174,6 +190,8 @@ local inventoryItems, statValues, squares, walkAllowed, walkTarget = {light}, {}
 local nativeBusy, traversingWindow = false, false
 local medicalParts=nil
 local playerPosition,waterReach={x=100.5,y=100.5,z=0},true
+local deferredMovement=0
+local fixtureRoom={getName=function() return "fixture-room" end}
 ClimbThroughWindowState={instance=function() return "fixture-window-state" end}
 local inventory={getItems=function() return vector(inventoryItems) end,
     getItemById=function(_,id)
@@ -193,32 +211,67 @@ player={getX=function() return playerPosition.x end,getY=function() return playe
         return damage
     end,
     getInventory=function() return inventory end,isKnownPoison=function(_,item) return item.poison or false end,
+    getPath2=function() return nil end,getDeferredMovement=function(_,vector) vector.length=deferredMovement end,
     getSquare=function() return {getRoom=function() return nil end} end,getPrimaryHandItem=function() return nil end,
     Say=function() effect("say") end,setSneaking=function() effect("sneak") end,
     faceLocation=function() effect("face") end,faceThisObject=function() effect("face") end,
     DoAttack=function() effect("attack") end,pressedMovement=function() return false end,pressedCancelAction=function() return false end}
 getSpecificPlayer=function() return player end
 local function square(x,y,z,objects)
-    return {getX=function() return x end,getY=function() return y end,getZ=function() return z end,
+    local result={getX=function() return x end,getY=function() return y end,getZ=function() return z end,
+        getProperties=function() return {has=function() return false end} end,
         getObjects=function() return vector(objects or {}) end,getBuilding=function() return nil end,
-        getRoom=function() return nil end,canReachTo=function() return waterReach end}
+        getRoom=function() return fixtureRoom end,canReachTo=function() return waterReach end,
+        canStand=function() return true end,TreatAsSolidFloor=function() return true end,
+        getBrokenGlass=function() return nil end,haveFire=function() return false end,
+        hasSlopedSurface=function() return false end,isVehicleIntersecting=function() return false end,
+        getStairs=function() return IsoObjectType.MAX end}
+    for _,name in ipairs({"isWindowTo","isDoorTo","isWallTo","isBlockedTo","isHoppableTo"}) do
+        result[name]=function() return false end
+    end
+    for _,name in ipairs({"getWindowTo","getWindowThumpableTo","getWindowFrameTo","getDoorTo","getHoppableTo","getWallHoppableTo"}) do
+        result[name]=function() return nil end
+    end
+    return result
 end
 player.getCurrentSquare=function()
     local x,y,z=math.floor(playerPosition.x),math.floor(playerPosition.y),math.floor(playerPosition.z)
     return squares[x..":"..y..":"..z] or square(x,y,z)
 end
+player.getSquare=function() return player:getCurrentSquare() end
 getCell=function() return {getZombieList=function() return vector(zombies) end,
     getGridSquare=function(_,x,y,z) return squares[x..":"..y..":"..z] or square(x,y,z) end} end
 ISTimedActionQueue={getTimedActionQueue=function() return {queue=queue} end,
     isPlayerDoingAction=function() return nativeBusy end,
     hasAction=function(action) for _,candidate in ipairs(queue) do if candidate==action then return true end end;return false end,
-    add=function(action) queue[#queue+1]=action; effect("queue");return {queue=queue} end,clear=function() queue={}; effect("clear") end}
+    add=function(action) queue[#queue+1]=action; effect("queue");return {queue=queue} end,
+    clear=function()
+        local current=queue[1]
+        if current and type(current.stop)=="function" then current:stop() end
+        queue={};effect("clear")
+    end}
 ISWalkToTimedAction={new=function(_,_,target) return {kind="walk",square=target} end}
 ISInventoryTransferAction={new=function(_,_,item,source,destination)
     return {kind="transfer",item=item,source=source,destination=destination}
 end}
 ISEatFoodAction={new=function(_,_,item) return {kind="eat",item=item} end}
 ISDrinkFluidAction={new=function(_,_,item) return {kind="drink",item=item} end}
+ISPathFindAction={pathToLocationF=function(_,p,x,y,z)
+    local action={kind="navigate",character=p,goal={"LocationF",x,y,z},target={x=x,y=y,z=z}}
+    function action:isValid() return true end
+    function action:start() effect("pathStart") end
+    function action:update() effect("pathUpdate") end
+    function action:stop() effect("pathCancel");queue={} end
+    function action:perform()
+        effect("pathPerform")
+        for i,candidate in ipairs(queue) do if candidate==self then table.remove(queue,i);break end end
+        if self.onCompleteFunc then self.onCompleteFunc(table.unpack(self.onCompleteArgs)) end
+    end
+    function action:setOnFail(fn,...) self.onFailFunc,self.onFailArgs=fn,{...} end
+    function action:setOnComplete(fn,...) self.onCompleteFunc,self.onCompleteArgs=fn,{...} end
+    function action:setRunActionsAfterFailing(value) self.runActionsAfterFailing=value end
+    return action
+end}
 luautils={walkAdj=function(p,target,keepActions)
     assert(p==player and keepActions==true,"loot must preserve explicitly managed action queue")
     effect("walkAdj");walkTarget=target
@@ -287,6 +340,7 @@ local function freshBody()
     nativeBusy, traversingWindow = false, false
     medicalParts=nil
     playerPosition,waterReach={x=100.5,y=100.5,z=0},true
+    deferredMovement=0
     Events={OnTick=event("tick"),OnKeyPressed=event("key"),OnMouseDown=event("mouse"),OnRightMouseDown=event("right"),
         OnGameStart=event("start"),OnCreatePlayer=event("create")}
     dofile(directory.."/ClaudeSurvivor.lua");tick()
@@ -299,9 +353,9 @@ end
 local function advance(n)
     for _=1,n or 1 do heartbeat();tick() end
 end
-local function command(action,seq)
+local function command(action,seq,a,b)
     seq=seq or 1
-    files["claude_intent.txt"]=table.concat({seq,action,0,0,"","","","LAB1",session,"fixture-world","0","body-test-token",clock,clock+2000},"|")
+    files["claude_intent.txt"]=table.concat({seq,action,a or 0,b or 0,"","","","LAB1",session,"fixture-world","0","body-test-token",clock,clock+2000},"|")
     advance(45)
     assert(files["claude_percept.json"],"body did not publish a percept")
 end
@@ -542,7 +596,7 @@ end
 bodyTest("water observations and capabilities describe the prepared narrow skills",function()
     tap(101,100);waterVessel(70,0,1);advance(60)
     local text=assert(files["claude_percept.json"])
-    assert(text:find('"bodyRevision":"care-1"',1,true))
+    assert(text:find('"bodyRevision":"nav-1"',1,true))
     assert(text:find('"tapDrinking":"safe_local_piped_only"',1,true))
     assert(text:find('"bottleFilling":"owned_compatible_vessel"',1,true))
     assert(text:find('"water":{',1,true) and text:find('"key":"101:100:0:0"',1,true))
@@ -685,7 +739,7 @@ end
 bodyTest("treatment observations advertise only supported self bandaging",function()
     medicalBody();bandageSupply(80);advance(60)
     local text=assert(files["claude_percept.json"])
-    assert(text:find('"bodyRevision":"care-1"',1,true))
+    assert(text:find('"bodyRevision":"nav-1"',1,true))
     assert(text:find('"injuryTreatment":"self_bandage_simple_bleeding"',1,true))
     assert(text:find('"treatment":{',1,true) and text:find('"eligibleWounds":[{"index":0,"name":"Hand_L"}]',1,true))
     assert(text:find('"key":"item:80"',1,true) and text:find('"fullType":"Base.Bandage"',1,true))
@@ -765,5 +819,133 @@ bodyTest("moving a dressing item into another container is not consumption",func
     local part=medicalBody();local item=bandageSupply(94);command("BANDAGE")
     dressed(part);consumeSupply(item);item.container={};queue={};advance(160)
     assert(outcome("status")=="unverified" and outcome("consumed")==false)
+end)
+
+-- These are visits observed from the actual body entry point. Path movement
+-- and completion are explicitly simulated; no engine route is being claimed.
+local function navigationText()
+    return assert(assert(files["claude_percept.json"]):match('"navigation":(%b{})'),"missing navigation snapshot")
+end
+local function remembered(x,y,z)
+    local list=assert(navigationText():match('"anchors":(%b[])'),"missing visited anchors")
+    for object in list:gmatch("%b{}") do
+        local function number(field) return tonumber(object:match('"'..field..'":([%d%.%-]+)')) end
+        if number("x")==x and number("y")==y and number("z")==z then
+            return {id=number("id"),x=x,y=y,z=z,canNavigate=object:find('"canNavigate":true',1,true)~=nil,raw=object}
+        end
+    end
+end
+local function observedReturnTarget()
+    local origin=assert(remembered(100.5,100.5,0),"initial occupied place was not remembered")
+    playerPosition.x=104.5;advance(60)
+    return assert(remembered(origin.x,origin.y,origin.z))
+end
+local function navigate(target,sequence) command("NAVIGATE",sequence or 1,target.id,0) end
+bodyTest("navigation memory reports only occupied places in the exact current namespace",function()
+    advance(60)
+    assert(navigationText():find('"scope":"current_session"',1,true))
+    assert(navigationText():find('"world":"fixture-world"',1,true) and navigationText():find('"session":"'..session..'"',1,true))
+    local origin=assert(remembered(100.5,100.5,0));assert(not origin.canNavigate)
+    assert(not remembered(104.5,100.5,0),"an unvisited nearby location was invented")
+    local target=observedReturnTarget();assert(target.id==origin.id and target.canNavigate)
+    assert(remembered(104.5,100.5,0),"current occupied place was not retained")
+end)
+bodyTest("NAVIGATE resolves a remembered destination without arbitrary movement offsets",function()
+    local target=observedReturnTarget();navigate(target);advance(60)
+    assert(#queue==1 and queue[1].kind=="navigate")
+    assert(queue[1].target.x==target.x and queue[1].target.y==target.y and queue[1].target.z==target.z)
+    assert(outcome("action")=="NAVIGATE" and outcome("targetId")==target.id and outcome("status")=="pending")
+end)
+bodyTest("unknown navigation ID refuses path scheduling",function()
+    command("NAVIGATE",1,999,0);advance(60)
+    assert(#queue==0 and not effects.pathStart and not effects.queue)
+    assert(outcome("action")=="NAVIGATE" and outcome("status")=="no_effect" and outcome("targetId")==999)
+    assert(percept("err"):match("^navigation:"))
+end)
+bodyTest("remembered places on another floor or beyond the bounded range cannot be navigated",function()
+    local target=assert(remembered(100.5,100.5,0))
+    playerPosition.x,playerPosition.z=104.5,1;advance(60);navigate(target);advance(60)
+    assert(#queue==0 and outcome("status")=="no_effect" and outcome("detail")=="place_other_floor")
+    playerPosition.x,playerPosition.z=140.5,0;advance(60);navigate(target,2);advance(60)
+    assert(#queue==0 and outcome("status")=="no_effect" and outcome("detail")=="place_out_of_range")
+end)
+bodyTest("navigation arrival needs actual raw position and idle action state",function()
+    local target=observedReturnTarget();navigate(target);local path=assert(queue[1]);path:start()
+    playerPosition.x,playerPosition.y=target.x,target.y;path:perform();advance(60)
+    assert(#queue==0 and outcome("status")=="arrived" and outcome("targetId")==target.id)
+    assert(math.abs(outcome("finalX")-target.x)<0.000001 and math.abs(outcome("finalY")-target.y)<0.000001)
+    assert(outcome("finalZ")==target.z and effects.pathPerform==1)
+end)
+bodyTest("empty navigation queue away from a destination is failure and cools down that route",function()
+    local target=observedReturnTarget();navigate(target);queue={};advance(60)
+    assert(outcome("status")=="no_effect" and outcome("detail")=="queue_empty_without_arrival")
+    local rememberedTarget=assert(remembered(target.x,target.y,target.z));assert(not rememberedTarget.canNavigate)
+    assert(rememberedTarget.raw:find('"blocker":"place_route_cooldown"',1,true))
+    local queued=effects.queue;navigate(target,2);advance(60)
+    assert(#queue==0 and effects.queue==queued and outcome("status")=="no_effect")
+    assert(percept("err"):find("place_route_cooldown",1,true))
+end)
+bodyTest("native completion callback away from the target cannot claim arrival",function()
+    local target=observedReturnTarget();navigate(target);queue[1]:perform();advance(60)
+    assert(outcome("status")=="no_effect" and outcome("nativeResult")=="completed")
+    assert(outcome("detail")=="native_completion_without_arrival")
+end)
+bodyTest("native path failure produces an explicit observed failure",function()
+    local target=observedReturnTarget();navigate(target);local path=assert(queue[1])
+    path.onFailFunc(table.unpack(path.onFailArgs));path:stop();advance(60)
+    assert(outcome("status")=="no_effect" and outcome("nativeResult")=="failed")
+    assert(outcome("detail")=="navigation_native_failed")
+end)
+bodyTest("native activity prevents an arrival receipt despite an empty Lua queue",function()
+    local target=observedReturnTarget();navigate(target);queue={};playerPosition.x,playerPosition.y=target.x,target.y
+    nativeBusy=true;advance(60);assert(outcome("status")=="pending")
+    nativeBusy=false;advance(60);assert(outcome("status")=="arrived")
+end)
+bodyTest("navigation cannot bypass a newly observed traversal edge",function()
+    local target=observedReturnTarget()
+    local unsafe=square(104,100,0);unsafe.isWindowTo=function() return true end;squares["104:100:0"]=unsafe
+    navigate(target);advance(60)
+    assert(#queue==0 and not effects.queue and outcome("status")=="no_effect")
+    assert(outcome("detail")=="navigation_local_edge_requires_traversal")
+end)
+bodyTest("navigation refuses an unreadable or excessive native movement bound",function()
+    local target=observedReturnTarget();deferredMovement=0.75;navigate(target);advance(60)
+    assert(#queue==0 and not effects.queue and outcome("status")=="no_effect")
+    assert(outcome("detail")=="navigation_movement_bound_unknown")
+    freshBody();target=observedReturnTarget();deferredMovement=nil;navigate(target);advance(60)
+    assert(#queue==0 and outcome("status")=="no_effect" and outcome("detail")=="navigation_movement_bound_unknown")
+end)
+bodyTest("manual takeover cancels navigation and retained methods preserve replacement work",function()
+    local target=observedReturnTarget();navigate(target);local retained=assert(queue[1]);retained:start()
+    for _,fn in ipairs(handlers.mouse) do fn() end
+    advance(60);assert(outcome("status")=="interrupted" and #queue==0)
+    local human={kind="human-path"};queue={human};local beforeCancel,beforePerform=effects.pathCancel,effects.pathPerform
+    retained:start();retained:update();retained:stop();retained:perform()
+    retained.onCompleteFunc(table.unpack(retained.onCompleteArgs));advance(60)
+    assert(queue[1]==human and effects.pathCancel==beforeCancel and effects.pathPerform==beforePerform)
+    assert(outcome("status")=="interrupted" and outcome("session")==session and percept("session")~=session)
+    assert(not remembered(target.x,target.y,target.z),"new controller namespace retained an old-session destination")
+end)
+bodyTest("pending navigation blocks water or medical work until explicit STOP",function()
+    local target=observedReturnTarget();medicalBody();local supply=bandageSupply(100);tap(105,100)
+    navigate(target);local path=assert(queue[1]);command("BANDAGE",2);advance(60)
+    assert(queue[1]==path and outcome("action")=="NAVIGATE" and outcome("status")=="pending")
+    assert(percept("err")=="intent:body_busy" and supply.container==inventory)
+    command("DRINKTAP",2);assert(queue[1]==path and outcome("action")=="NAVIGATE")
+    command("STOP",2);advance(60);assert(#queue==0 and outcome("status")=="interrupted")
+end)
+bodyTest("new navigation receipt supersedes a completed medical result",function()
+    local part=medicalBody();local item=bandageSupply(101);command("BANDAGE")
+    dressed(part);consumeSupply(item);queue={};advance(60)
+    assert(outcome("status")=="observed_effect")
+    local target=observedReturnTarget();navigate(target,2);advance(60)
+    assert(outcome("seq")==2 and outcome("action")=="NAVIGATE" and outcome("status")=="pending")
+end)
+bodyTest("later water work supersedes a completed navigation result",function()
+    local target=observedReturnTarget();navigate(target);local path=assert(queue[1])
+    playerPosition.x,playerPosition.y=target.x,target.y;path:perform();advance(60)
+    assert(outcome("status")=="arrived")
+    tap(101,100);statValues[CharacterStat.THIRST]=0.7;command("DRINKTAP",2);advance(60)
+    assert(outcome("seq")==2 and outcome("action")=="DRINKTAP" and outcome("status")=="pending")
 end)
 print("passed "..count.." lab Lua tests")

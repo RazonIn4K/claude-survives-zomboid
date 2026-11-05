@@ -36,6 +36,8 @@ require "ClaudeWaterFacts"
 require "ClaudeWaterSkill"
 require "ClaudeTreatmentFacts"
 require "ClaudeTreatmentSkill"
+require "ClaudePlaceMemory"
+require "ClaudeNavigationSkill"
 local function readActionState(p)
   local count, nativeBusy, traversing = -1, nil, nil
   pcall(function()
@@ -52,6 +54,8 @@ end
 local actionEvidence = ClaudeActionEvidence.new()
 local waterSkill = ClaudeWaterSkill.new()
 local treatmentSkill = ClaudeTreatmentSkill.new()
+local placeMemory = ClaudePlaceMemory.new()
+local navigationSkill = ClaudeNavigationSkill.new()
 local lab = ClaudeLabControl.new({
   now = function() return tonumber(getTimestampMs()) end,
   random = function() return ZombRand(1000000) end,
@@ -69,11 +73,13 @@ local lab = ClaudeLabControl.new({
     return count < 0 or nativeBusy ~= false or count > 0
       or (waterSkill.receipt~=nil and waterSkill.receipt.status=="pending")
       or (treatmentSkill.receipt~=nil and treatmentSkill.receipt.status=="pending")
+      or (navigationSkill.receipt~=nil and navigationSkill.receipt.status=="pending")
   end,
   stop = function(p)
     actionEvidence:cancel("control_revoked")
     waterSkill:cancel("control_revoked")
     treatmentSkill:cancel("control_revoked")
+    navigationSkill:cancel("control_revoked")
     travel.active, travel.budget, observing = false, 0, false
     if not p then return false end
     local ok, empty = pcall(function()
@@ -84,6 +90,20 @@ local lab = ClaudeLabControl.new({
     return ok and empty
   end,
 })
+
+local function placeIdentity() return {world=lab.world,actor=lab.actor,session=lab.session} end
+local function placePosition(p)
+  local ok,pos=pcall(function()
+    if p:isDead()~=false then return nil end
+    local sq=p:getCurrentSquare()
+    if not sq then return nil end
+    local z=p:getZ()
+    if type(z)~="number" or z~=sq:getZ() then return nil end
+    local room=sq:getRoom()
+    return {x=p:getX(),y=p:getY(),z=z,room=room and room:getName() or "outside"}
+  end)
+  return ok and pos or nil
+end
 
 -- shared with the HUD (below)
 local HUD = {
@@ -288,6 +308,7 @@ local function buildPercept(p)
   local health = ClaudeHealthFacts.read(p)
   local water = ClaudeWaterFacts.read(p)
   local treatment = ClaudeTreatmentFacts.read(p)
+  local navigation = placeMemory:snapshot(placeIdentity(),placePosition(p),tonumber(getTimestampMs()))
 
   local hour, day = 0, 0
   pcall(function() hour = getGameTime():getHour() end)
@@ -316,7 +337,7 @@ local function buildPercept(p)
   local j = '{'
   j = j .. '"dead":' .. tostring(p:isDead())
   j = j .. ',"labProtocol":1,"armed":' .. tostring(lab.armed)
-  j = j .. ',"bodyRevision":"care-1"'
+  j = j .. ',"bodyRevision":"nav-1"'
   j = j .. ',"session":"' .. esc(lab.session or "") .. '","world":"' .. esc(lab.world or "") .. '"'
   j = j .. ',"actor":"' .. esc(lab.actor or "") .. '","labToken":"' .. esc(lab.token or "") .. '"'
   j = j .. ',"observed_ms":' .. string.format("%.0f", tonumber(getTimestampMs()))
@@ -328,9 +349,10 @@ local function buildPercept(p)
   j = j .. ',"room":"' .. esc(room) .. '"'
   j = j .. ',"hp":' .. n2(hp)
   j = j .. ',"health":' .. ClaudeHealthFacts.toJSON(health)
-  j = j .. ',"capabilities":{"injuryObservation":true,"injuryTreatment":"self_bandage_simple_bleeding","windowSmash":false,"windowTraverse":"adjacent_safe_only","tapDrinking":"safe_local_piped_only","bottleFilling":"owned_compatible_vessel"}'
+  j = j .. ',"capabilities":{"injuryObservation":true,"injuryTreatment":"self_bandage_simple_bleeding","windowSmash":false,"windowTraverse":"adjacent_safe_only","tapDrinking":"safe_local_piped_only","bottleFilling":"owned_compatible_vessel","navigation":"same_room_clear_local_edges","placeMemory":"current_session"}'
   j = j .. ',"water":' .. ClaudeWaterFacts.toJSON(water)
   j = j .. ',"treatment":' .. ClaudeTreatmentFacts.toJSON(treatment)
+  j = j .. ',"navigation":' .. ClaudePlaceMemory.toJSON(navigation)
   j = j .. ',"hunger":' .. n2(hunger) .. ',"thirst":' .. n2(thirst) .. ',"fatigue":' .. n2(fatigue)
   j = j .. ',"endurance":' .. n2(endurance) .. ',"panic":' .. n2(panic)
   j = j .. ',"zTotal":' .. zTotal .. ',"zNear":' .. zNear .. ',"zClose":' .. zClose
@@ -348,6 +370,7 @@ local function buildPercept(p)
   local receipt = actionEvidence.receipt
   if waterSkill.receipt and (not receipt or waterSkill.receipt.seq >= receipt.seq) then receipt=waterSkill.receipt end
   if treatmentSkill.receipt and (not receipt or treatmentSkill.receipt.seq >= receipt.seq) then receipt=treatmentSkill.receipt end
+  if navigationSkill.receipt and (not receipt or navigationSkill.receipt.seq >= receipt.seq) then receipt=navigationSkill.receipt end
   if receipt then
     j = j .. ',"actionOutcome":{"seq":' .. receipt.seq .. ',"action":"' .. esc(receipt.action)
       .. '","world":"' .. esc(receipt.world) .. '","actor":"' .. esc(receipt.actor)
@@ -364,7 +387,13 @@ local function buildPercept(p)
       .. ',"bandaged":' .. (receipt.bandaged==nil and "null" or tostring(receipt.bandaged))
       .. ',"consumed":' .. (receipt.consumed==nil and "null" or tostring(receipt.consumed))
       .. ',"bleedingAfter":' .. (receipt.bleedingAfter==nil and "null" or tostring(receipt.bleedingAfter))
-      .. ',"detail":"' .. esc(receipt.detail) .. '"}'
+      .. ',"targetId":' .. tostring(receipt.targetId or 0)
+      .. ',"nativeResult":"' .. esc(receipt.nativeResult or "") .. '"'
+    for _,field in ipairs({"startX","startY","startZ","targetX","targetY","targetZ","finalX","finalY","finalZ","distanceRemaining"}) do
+      local value=receipt[field]
+      j=j..',"'..field..'":'..(type(value)=="number" and value==value and math.abs(value)<math.huge and string.format("%.6f",value) or "null")
+    end
+    j=j .. ',"detail":"' .. esc(receipt.detail) .. '"}'
   end
   j = j .. ',"bldgDir":"' .. bldgDir .. '","bldgDist":' .. bldgDist
   j = j .. ',"weapon":"' .. weapon .. '"'
@@ -412,6 +441,7 @@ local function doMove(p, dx, dy)
   actionEvidence:cancel("movement_replaced_action")
   waterSkill:cancel("movement_replaced_water_task")
   treatmentSkill:cancel("movement_replaced_treatment")
+  navigationSkill:cancel("movement_replaced_navigation")
   ISTimedActionQueue.clear(p)
   travel.active, travel.budget = false, 0
   stepWalk(p, dx, dy)
@@ -485,6 +515,20 @@ local function doBandage(p,seq)
   local started,reason=treatmentSkill:start(p,seq,bindAuthorization(p),
     {world=lab.world,actor=lab.actor,session=lab.session})
   if not started then lastError="treatment: "..tostring(reason) end
+end
+
+local function doNavigate(p,seq,targetId)
+  local identity,now,pos=placeIdentity(),tonumber(getTimestampMs()),placePosition(p)
+  local target,reason=placeMemory:resolve(targetId,identity,now)
+  local permitted,blocker=placeMemory:canAttempt(targetId,pos,identity,now)
+  if not target or not permitted then
+    lastError="navigation: "..tostring(reason or blocker)
+    navigationSkill.receipt={seq=seq,action="NAVIGATE",targetId=targetId,world=identity.world,
+      actor=identity.actor,session=identity.session,status="no_effect",phase="validate",detail=reason or blocker}
+    return
+  end
+  local started,problem=navigationSkill:start(p,seq,target,bindAuthorization(p),identity)
+  if not started then lastError="navigation: "..tostring(problem) end
 end
 
 -- close the nearest open door (buys time when fleeing indoors — zombies must thump through)
@@ -595,6 +639,7 @@ local function execIntent(p, line)
   local action = parts[2] or "WAIT"
   waterSkill:cancel("superseded_by_"..action)
   treatmentSkill:cancel("superseded_by_"..action)
+  navigationSkill:cancel("superseded_by_"..action)
   local a, b = parts[3], parts[4]
   local say = parts[5] or ""
   local thought = parts[6] or ""
@@ -634,6 +679,7 @@ local function execIntent(p, line)
   elseif action == "DRINK" then travel.active = false; doDrink(p)
   elseif action == "DRINKTAP" or action == "FILLBOTTLE" then travel.active = false; doWater(p,seq,action)
   elseif action == "BANDAGE" then travel.active = false; doBandage(p,seq)
+  elseif action == "NAVIGATE" then travel.active = false; doNavigate(p,seq,tonumber(a))
   elseif action == "LOOT" then travel.active = false; doLoot(p)
   elseif action == "EQUIP" then travel.active = false; doEquip(p)
   elseif action == "CLOSEDOOR" then travel.active = false; doCloseDoor(p)
@@ -705,6 +751,7 @@ local function engage(p, z, d)
   actionEvidence:cancel("combat_reflex_interrupted_action")
   waterSkill:cancel("combat_reflex_interrupted_water_task")
   treatmentSkill:cancel("combat_reflex_interrupted_treatment")
+  navigationSkill:cancel("combat_reflex_interrupted_navigation")
   pcall(function() p:faceThisObject(z) end)
   if d <= 1.8 then
     pcall(function() p:DoAttack(0) end)          -- in range: swing
@@ -775,8 +822,14 @@ local function onTick()
   local active = lab:update(p)
   if not p then return end
   lastSeq = lab.lastSeq
+  placeMemory:observe(placeIdentity(),placePosition(p),tonumber(getTimestampMs()))
   waterSkill:update()
   treatmentSkill:update()
+  navigationSkill:update()
+  local navReceipt=navigationSkill.receipt
+  if navReceipt and navReceipt.status~="pending" and navReceipt.startX~=nil then
+    placeMemory:recordOutcome(navReceipt,{x=navReceipt.startX,y=navReceipt.startY,z=navReceipt.startZ},tonumber(getTimestampMs()))
+  end
   if actionEvidence.receipt and actionEvidence.receipt.status == "pending" then
     local ok, qlen = pcall(function()
       local q = ISTimedActionQueue.getTimedActionQueue(p)

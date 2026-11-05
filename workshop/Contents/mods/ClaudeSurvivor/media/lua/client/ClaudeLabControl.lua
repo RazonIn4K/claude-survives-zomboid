@@ -16,7 +16,7 @@ end
 local function identifier(value)
     return type(value) == "string" and #value > 0 and #value <= 180 and value:match("^[%w_%.:%-]+$")
 end
-local allowed = {MOVE=true, LOOT=true, EAT=true, DRINK=true, DRINKTAP=true, FILLBOTTLE=true, BANDAGE=true, EQUIP=true,
+local allowed = {MOVE=true, NAVIGATE=true, LOOT=true, EAT=true, DRINK=true, DRINKTAP=true, FILLBOTTLE=true, BANDAGE=true, EQUIP=true,
     CLOSEDOOR=true, CONCEAL=true, BREAKIN=true, STOP=true, WAIT=true}
 
 function ClaudeLabControl.new(env)
@@ -120,6 +120,11 @@ function ClaudeLabControl.new(env)
             local dx, dy = integer(f[3]), integer(f[4])
             if not dx or not dy or dx*dx + dy*dy == 0 or dx*dx + dy*dy > 16 then
                 return nil, "movement_bounds"
+            end
+        elseif f[2] == "NAVIGATE" then
+            local destination,unused=integer(f[3]),integer(f[4])
+            if not destination or destination<1 or destination>2147483647 or unused~=0 then
+                return nil,"navigation_target_invalid"
             end
         end
         self.lastSeq = seq

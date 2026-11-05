@@ -121,6 +121,8 @@ function readPercept() {
     const age = Date.now() - after.mtimeMs;
     if (age > MAX_PERCEPT_AGE_MS || age < -1000) return false;
     percept = j;
+    // Archived facts are never restored as live knowledge or fed back to Lua.
+    state.navigation = j.navigation ?? null;
     const outcome = j.actionOutcome;
     if (outcome && outcome.status !== 'pending' && Number.isSafeInteger(outcome.seq)) {
       const key = JSON.stringify([outcome.world, outcome.actor, outcome.session, outcome.seq, outcome.action, outcome.status]);
@@ -217,8 +219,11 @@ HEALTH: health reports a read-only body-part snapshot with explicit validity, kn
 
 WATER: water.sources lists supported clean local piped fixtures within4 Manhattan tiles on your floor, with exact coordinates and reachable facts. This is loaded proximity information, not vision or a guaranteed route. Missing/partial scans mean unknown, not that the house has no water. water.fillableVessels lists compatible top-level carried vessels with remaining capacity. DRINKTAP/FILLBOTTLE each own an approach, fresh safety/reach check, native action and measured-result check; wait for their outcome. They reject unknown, mixed/tainted/poisoned, natural and external-plumbed sources. Do not claim success from an accepted command, spoken thought or queue ending. actionOutcome.amountGain/sourceKey/vesselKey identify observed filling; thirstDrop identifies observed drinking. After a failed task, do not repeat it without changed source, position or vessel facts. These outcomes are observations, not proof of general navigation or survival competence.
 
+NAVIGATION: navigation is bounded factual memory from this client session only. Anchors are places this survivor actually occupied; origin means first observed position, not a safehouse. canNavigate only marks a candidate passing memory/range/cooldown checks, not proof of a safe or reachable path. The body applies stricter physical checks. After NAVIGATE wait for actionOutcome: arrived requires actual raw position/floor and idle Lua/native state, not a path callback alone. Failed routes have temporary cooldowns; do not repeat unchanged failures. Memory resets on world/actor/session change and is not restored across reconnects. A free-text story cannot add destinations or claim unseen rooms were searched. Prefer a remembered ID for supported return movement; MOVE remains a separate short primitive. This is not general exploration or door traversal.
+
 ACTIONS (one per turn):
   MOVE dx dy — one nonzero integer offset, radius <=4 tiles. No momentum or automatic continuation.
+  NAVIGATE targetId — return to an actually visited navigation.anchors ID with canNavigate=true. The body validates a clear same-room route and actual arrival; it refuses doors/windows/fences/stairs, unknown facts and outdoors. No arbitrary coordinates or cross-building routes.
   LOOT        — prioritize safe food/pure water across nearby containers (within4 tiles), else one useful weapon when unarmed. No household junk fallback. Check nearbyLoot and actionOutcome; do not repeat failed looting without a changed position or supply observation.
   EAT / DRINK — consume food / water from inventory (check foods>0 / waters>0).
   DRINKTAP    — approach the nearest supported water.sources fixture, recheck reach/safety, then drink. Use only when thirsty and a supported source is observed. Blocking facewear is refused.
@@ -262,7 +267,7 @@ Reply STRICT JSON only, no prose outside it:
  "subtask":"the concrete step you're on right now toward the goal, a short phrase",
  "thought":"inner monologue, FIRST PERSON, ONE short punchy sentence under ~100 chars — never third person",
  "say":"words you speak ALOUD, first person, <=90 chars, or \\"\\" if silent — NOT narration",
- "action":{"type":"MOVE","dx":0,"dy":0} | {"type":"LOOT"} | {"type":"EAT"} | {"type":"DRINK"} | {"type":"DRINKTAP"} | {"type":"FILLBOTTLE"} | {"type":"BANDAGE"} | {"type":"EQUIP"} | {"type":"CLOSEDOOR"} | {"type":"CONCEAL"} | {"type":"BREAKIN"} | {"type":"STOP"} | {"type":"WAIT"},
+ "action":{"type":"MOVE","dx":0,"dy":0} | {"type":"NAVIGATE","targetId":1} | {"type":"LOOT"} | {"type":"EAT"} | {"type":"DRINK"} | {"type":"DRINKTAP"} | {"type":"FILLBOTTLE"} | {"type":"BANDAGE"} | {"type":"EQUIP"} | {"type":"CLOSEDOOR"} | {"type":"CONCEAL"} | {"type":"BREAKIN"} | {"type":"STOP"} | {"type":"WAIT"},
  "memory":"REPLACE your scratchpad (<=400 chars): landmarks, what you have, lessons — NOT the goal (that's separate)"}`;
 
 async function decide() {
@@ -341,16 +346,16 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     }
     const a = out.action;
     if (!a || typeof a !== 'object' || Array.isArray(a) || typeof a.type !== 'string'
-      || !['MOVE', 'LOOT', 'EAT', 'DRINK', 'DRINKTAP', 'FILLBOTTLE', 'BANDAGE', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(a.type)) {
+      || !['MOVE', 'NAVIGATE', 'LOOT', 'EAT', 'DRINK', 'DRINKTAP', 'FILLBOTTLE', 'BANDAGE', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(a.type)) {
       throw new Error('Model reply must contain one supported action object.');
     }
-    const type = a.type, dx = a.dx, dy = a.dy;
+    const type = a.type, dx = a.dx, dy = a.dy, targetId = a.targetId;
     const reply = String(out.reply || '').replace(/[\r\n]/g, ' ').trim().slice(0, 120);
     const say = String((god.length && reply) ? reply : (out.say || '')).replace(/[|\r\n]/g, ' ').slice(0, 90);
     const thoughtField = String(out.thought || '').replace(/[|\r\n]/g, ' ').slice(0, 200);
     const goalCandidate = String(out.subtask || out.goal || state.subtask || state.goal || '').trim().slice(0, 90);
     const nextSeq = Math.max(state.seq, Number(percept.lastSeq) || 0) + 1;
-    const wire = lab.intent(percept, nextSeq, { type, dx, dy }, say, thoughtField, goalCandidate);
+    const wire = lab.intent(percept, nextSeq, { type, dx, dy, targetId }, say, thoughtField, goalCandidate);
     writeIntentFile(wire); // Do not accept model-authored state if publication fails.
     if (god.length && reply) {
       state.chat.push({ from: 'claude', text: reply, t: new Date().toISOString().slice(11, 19) });
@@ -362,7 +367,7 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     state.seq = nextSeq;
     intentLine = wire;
     lastThought = String(out.thought || '').slice(0, 500);
-    lastAction = type === 'MOVE' ? `MOVE ${dx},${dy}` : type;
+    lastAction = type === 'MOVE' ? `MOVE ${dx},${dy}` : (type === 'NAVIGATE' ? `NAVIGATE ${targetId}` : type);
     if (out.memory) state.memory = String(out.memory).slice(0, 600);
     brainNote = 'claude';
     log('decide', `[${state.subtask}] ${lastAction}${say ? ` · "${say}"` : ''} — ${lastThought}`);
@@ -417,6 +422,7 @@ input{width:70%;background:#151b22;border:1px solid #26303a;color:#dde3ea;paddin
 <div class="grid" id="stats"></div>
 <div class="note" id="health"></div>
 <div class="note" id="treatment"></div>
+<div class="note" id="navigation"></div>
 <div class="note" id="water"></div>
 <h1 style="font-size:14px;margin-top:20px">The voice from beyond</h1>
 <div id="chat" style="background:#0c0f13;border-radius:6px;padding:10px;max-height:240px;overflow:auto;margin-bottom:8px;display:flex;flex-direction:column;gap:6px"></div>
@@ -447,6 +453,7 @@ const water=p?.water;const outcome=p?.actionOutcome;let waterCheck='Water check:
 if(water){waterCheck='Water check: '+(water.valid===true?'observed':'incomplete');if(Array.isArray(water.sources))waterCheck+=' · supported sources: '+water.sources.length;if(Array.isArray(water.fillableVessels))waterCheck+=' · fillable vessels: '+water.fillableVessels.length;}
 if(outcome&&['DRINKTAP','FILLBOTTLE'].includes(outcome.action))waterCheck+=' · '+String(outcome.phase||'observe')+': '+String(outcome.status||'unknown')+' · '+String(outcome.detail||'');
 document.getElementById('water').textContent=waterCheck;
+const navigation=p?.navigation;let placeCheck='Visited places: unavailable';if(navigation){placeCheck='Visited places (this session): '+(navigation.valid===true?String(navigation.anchorCount||0):'unknown');if(Array.isArray(navigation.anchors))placeCheck+=' · '+navigation.anchors.slice(0,12).map(a=>'#'+String(a.id)+' '+String(a.room||'place')+(a.canNavigate===true?'':' ['+String(a.blocker||'unavailable')+']')).join(', ');}if(p?.actionOutcome?.action==='NAVIGATE')placeCheck+=' · '+String(p.actionOutcome.status||'unknown')+': '+String(p.actionOutcome.detail||'');document.getElementById('navigation').textContent=placeCheck;
 const chat=s.chat||[];const cbox=document.getElementById('chat');
 cbox.innerHTML=chat.map(function(m){var god=m.from==='god';
 return '<div style="align-self:'+(god?'flex-end':'flex-start')+';max-width:78%;background:'+(god?'#26303a':'#1c2733')+';border-left:3px solid '+(god?'#ffd479':'#7fd1b9')+';padding:6px 10px;border-radius:6px"><div style="font-size:10px;color:#8899aa;text-transform:uppercase">'+(god?'you':'him')+' · '+escapeHTML(m.t)+'</div>'+escapeHTML(m.text)+'</div>';}).join('');

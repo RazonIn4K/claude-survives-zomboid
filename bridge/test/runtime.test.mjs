@@ -42,19 +42,23 @@ test('unresolved existing evidence prevents a gameplay model request',{timeout:4
 });
 
 test('survival skills retain measured outcomes through the real bridge transport',{timeout:12000},async t=>{
-  await Promise.all(['DRINKTAP','FILLBOTTLE','BANDAGE'].map(type=>t.test(type,async t=>{
-    const run=temporaryRun(t);const game=fakeGame(run,{water:{valid:true,sources:[{key:'100:100:0:0',reachable:true}],fillableVessels:[{key:'item:5',amount:0,capacity:2}]}});
+  await Promise.all(['DRINKTAP','FILLBOTTLE','BANDAGE','NAVIGATE'].map(type=>t.test(type,async t=>{
+    const run=temporaryRun(t);const game=fakeGame(run,{water:{valid:true,sources:[{key:'100:100:0:0',reachable:true}],fillableVessels:[{key:'item:5',amount:0,capacity:2}]},
+      navigation:{valid:true,scope:'current_session',world:'fixture-world',actor:'0',session:'fixture-session',anchorCount:1,
+        anchors:[{id:7,x:102,y:100,z:0,canNavigate:true}]}});
     const origin={world:'fixture-world',actor:'0',session:'fixture-session'};
     game.onIntent=()=>{game.state.actionOutcome={...origin,seq:1,action:type,status:'pending',phase:type==='BANDAGE'?'bandage':'approach'};};
     const endpoint=await model(run,(_req,res)=>{
-      reply(res,{action:{type}});
+      reply(res,{action:type==='NAVIGATE'?{type,targetId:7}:{type}});
     });
     const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_REQUESTS:'1'});
     await boot(processRun);await waitFor(()=>game.state.lastSeq===1,()=>processRun.output());
     const wire=fs.readFileSync(path.join(run.luaDir,'claude_intent.txt'),'utf8');
     assert.equal(wire.split('|')[1],type);assert.equal(endpoint.calls.length,1);
     assert.match(endpoint.calls[0].body.messages[0].content,/DRINKTAP.*FILLBOTTLE/s);
-    game.state.actionOutcome={...origin,seq:1,action:type,status:'observed_effect',phase:'verify',
+    if(type==='NAVIGATE'){assert.equal(wire.split('|')[2],'7');assert.equal(wire.split('|')[3],'0');game.state.x=102;}
+    game.state.actionOutcome={...origin,seq:1,action:type,status:type==='NAVIGATE'?'arrived':'observed_effect',phase:'verify',
+      targetId:type==='NAVIGATE'?7:0,finalX:type==='NAVIGATE'?102:100,finalY:100,finalZ:0,distanceRemaining:0,
       sourceKey:'100:100:0:0',vesselKey:type==='FILLBOTTLE'?'item:5':'',
       supplyKey:type==='BANDAGE'?'item:5':'',partIndex:type==='BANDAGE'?0:-1,bandaged:type==='BANDAGE',consumed:type==='BANDAGE',
       amountGain:type==='FILLBOTTLE'?2:0,thirstDrop:type==='DRINKTAP'?0.4:0};game.publish();
@@ -64,7 +68,25 @@ test('survival skills retain measured outcomes through the real bridge transport
     assert.equal(state.outcomes[0].sourceKey,'100:100:0:0');
     assert.equal(state.outcomes[0].amountGain,type==='FILLBOTTLE'?2:0);
     if(type==='BANDAGE')assert.equal(state.outcomes[0].consumed,true);
+    if(type==='NAVIGATE'){assert.equal(state.outcomes[0].status,'arrived');assert.equal(state.outcomes[0].targetId,7);assert.equal(state.navigation.anchors[0].id,7);}
     assert.equal(state.disarmObserved,true);
+  })));
+});
+
+test('a remembered destination is revalidated after a delayed model reply',{timeout:9000,concurrency:true},async t=>{
+  await Promise.all(['removed','cooldown','other namespace'].map(change=>t.test(change,async t=>{
+    const run=temporaryRun(t);const game=fakeGame(run,{navigation:{valid:true,scope:'current_session',world:'fixture-world',actor:'0',session:'fixture-session',anchors:[{id:7,canNavigate:true}]}});
+    let held;const endpoint=await model(run,(_req,res)=>{held=res;});
+    const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_REQUESTS:'1'});
+    await boot(processRun);await waitFor(()=>held,()=>processRun.output());
+    if(change==='removed')game.state.navigation.anchors=[];
+    if(change==='cooldown')game.state.navigation.anchors[0].canNavigate=false;
+    if(change==='other namespace')game.state.navigation.session='old-session';
+    game.publish();reply(held,{action:{type:'NAVIGATE',targetId:7},memory:'must not be accepted'});
+    const[code]=await processRun.exited;assert.equal(code,0);assert.equal(endpoint.calls.length,1);
+    assert.equal(fs.existsSync(path.join(run.luaDir,'claude_intent.txt')),false);
+    const saved=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));assert.equal(saved.seq,0);
+    assert.equal(saved.memory,'(fresh mind — nothing yet)');
   })));
 });
 
@@ -353,6 +375,11 @@ test('dashboard exposes session limits and accepts only same-origin POST stop',{
   assert.equal(elements.get('treatment').innerHTML,undefined);
   assert.match(elements.get('treatment').textContent,/Treatment check: incomplete.*supported wounds: 1.*clean supplies: 1/);
   assert.ok(elements.get('treatment').textContent.includes(payload));
+  renderState.percept.navigation={valid:true,scope:'current_session',anchorCount:1,anchors:[{id:7,room:payload,canNavigate:false,blocker:payload}]};
+  renderState.percept.actionOutcome={action:'NAVIGATE',status:'unverified',detail:payload};
+  await runInNewContext(script[1],{document,fetch:async()=>({json:async()=>renderState}),setInterval:()=>0});
+  assert.equal(elements.get('navigation').innerHTML,undefined);
+  assert.ok(elements.get('navigation').textContent.includes(payload));
   assert.equal((await fetch(`${base}/control/stop`)).status,405);
   assert.equal((await fetch(`${base}/control/stop`,{method:'POST'})).status,403);
   assert.equal((await fetch(`${base}/control/stop`,{method:'POST',headers:{Origin:'https://untrusted.example'}})).status,403);

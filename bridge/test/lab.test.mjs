@@ -175,6 +175,24 @@ test('self-bandaging uses one supported identity-bound command',()=>{
   assert.equal(wire.split('|').length,14);
   assert.match(wire,/\|LAB1\|session-1\|world-1\|0\|test-token\|1000000\|1002000$/);
 });
+test('navigation resolves known available anchor IDs without publishing model coordinates',()=>{
+  const navigation={valid:true,scope:'current_session',world:'world-1',actor:'0',session:'session-1',anchors:[{id:7,x:100.5,y:100.5,z:0,canNavigate:true},
+    {id:8,x:101.5,y:100.5,z:0,canNavigate:false}]};
+  const current=fixture({navigation});const lab=run();lab.bind(current);
+  const wire=lab.intent(current,1,{type:'NAVIGATE',targetId:7,dx:999,dy:-999});
+  assert.equal(wire.split('|')[1],'NAVIGATE');assert.equal(wire.split('|')[2],'7');assert.equal(wire.split('|')[3],'0');
+  assert.equal(wire.split('|').length,14);
+  assert.match(wire,/\|LAB1\|session-1\|world-1\|0\|test-token\|1000000\|1002000$/);
+  for(const targetId of [0,-1,1.5,2147483648,'7',null,undefined,8,99]) {
+    assert.throws(()=>lab.intent(current,2,{type:'NAVIGATE',targetId}));
+  }
+  for(const changed of [undefined,{...navigation,valid:false},{...navigation,scope:'unknown'},
+    {...navigation,world:'other-world'},{...navigation,actor:'other-actor'},{...navigation,session:'old-session'},
+    {...navigation,session:undefined},
+    {...navigation,anchors:[]},{...navigation,anchors:[...navigation.anchors,navigation.anchors[0]]}]) {
+    assert.throws(()=>lab.intent(fixture({navigation:changed}),2,{type:'NAVIGATE',targetId:7}));
+  }
+});
 test('lifetime starts before first percept and cannot be extended by heartbeats',()=>{
   let time=1000000;
   const lab=new LabRun(labConfig({PZ_LAB_ARM:'1',PZ_MAX_SECONDS:'1'}),{now:()=>time,token:'test-token'});
@@ -196,5 +214,5 @@ test('Lua lab gate and actual body entry point enforce takeover',t=>{
   const result=spawnSync('lua',[script,directory],{encoding:'utf8',timeout:5000});
   if(result.error?.code==='ENOENT') { t.skip('Lua is not installed; gate engine stubs were not run.');return; }
   assert.equal(result.status,0,`${result.stdout}\n${result.stderr}`);
-  assert.match(result.stdout,/passed 55 lab Lua tests/);
+  assert.match(result.stdout,/passed 71 lab Lua tests/);
 });

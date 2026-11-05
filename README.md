@@ -30,6 +30,13 @@
 > and exact supply consumption must both be observed. Complex wounds, busy
 > medical targets and unknown facts are refused. This remains offline-tested;
 > actual multiplayer treatment, replication and interruption are unverified.
+>
+> **Offline navigation update:** `nav-1` remembers actually visited positions
+> during the current control session and accepts remembered destination IDs.
+> It checks raw arrival and native inactivity, with temporary route cooldowns.
+> Navigation is restricted to clear local movement within one indoor room;
+> door/window/fence traversal, outdoor routes and reconnect persistence are not
+> implemented by this skill. Actual multiplayer behavior remains unverified.
 
 <div align="center">
 
