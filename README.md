@@ -4,8 +4,10 @@
 > permanently revokes that session; there is no idle auto-resume. Movement
 > momentum and automatic game-speed changes are disabled. Read
 > [the current lab protocol and startup instructions](bridge/README.md) before
-> using the older upstream feature descriptions below. Survival engine actions
-> have not yet been verified in our B42.21 multiplayer laboratory.
+> using the older upstream feature descriptions below. An isolated B42.21 multiplayer
+> test observed looting and screwdriver equip; eating, drinking and combat remain
+> unverified in-game. The current update prioritizes safe food and pure water,
+> omits junk fallback, and reports inventory/needs evidence for LOOT/EAT/DRINK.
 
 <div align="center">
 

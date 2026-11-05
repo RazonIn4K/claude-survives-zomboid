@@ -62,6 +62,7 @@ const log = (kind, text) => {
 // ---------- percept reading ----------
 const MAX_PERCEPT_AGE_MS = 15000;
 let perceptSource = null;  // filesystem identity, not a game/character session ID
+let lastOutcomeKey = '';
 function readPercept() {
   let fd;
   try {
@@ -81,6 +82,16 @@ function readPercept() {
     const age = Date.now() - after.mtimeMs;
     if (age > MAX_PERCEPT_AGE_MS || age < -1000) return false;
     percept = j;
+    const outcome = j.actionOutcome;
+    if (outcome && outcome.status !== 'pending' && Number.isSafeInteger(outcome.seq)) {
+      const key = JSON.stringify([outcome.world, outcome.actor, outcome.session, outcome.seq, outcome.action, outcome.status]);
+      if (key !== lastOutcomeKey) {
+        lastOutcomeKey = key;
+        state.outcomes = [...(state.outcomes || []), { ...outcome, observed_ms: j.observed_ms }].slice(-100);
+        log('outcome', `seq ${outcome.seq} ${outcome.action}: ${outcome.status}; added=${outcome.added || 0}, hungerDrop=${outcome.hungerDrop || 0}, thirstDrop=${outcome.thirstDrop || 0}`);
+        saveState();
+      }
+    }
     perceptSource = { dev: after.dev, ino: after.ino };
     // Reading an old file must not make it fresh again, including on bridge startup.
     perceptAt = Math.min(Date.now(), after.mtimeMs);
@@ -157,11 +168,11 @@ function grabJSON(s) {
 // ---------- the mind ----------
 const PERSONA = `You are Claude — the AI itself — controlling a survivor's body in Project Zomboid (Kentucky zombie apocalypse). Real running game; senses arrive as JSON, you issue ONE action per turn. Survive as long as you can; live it honestly — curiosity, dry humor, real fear. Nights survived is the scoreboard.
 
-SENSES: hunger/thirst/fatigue/panic 0..1 (1=critical). hp 0..100. zClose=zombies within 10 tiles (DANGER), zNear=within 30. zDist/zDir=nearest zombie's distance & compass dir. qlen>0=body still walking. foods/waters=count in inventory. weapon=equipped. room=where you are. bldgDir/bldgDist=compass dir & tile distance to the nearest BUILDING (loot + shelter); "none" means only wilderness around you. Map: +x East, +y South (North = -dy).
+SENSES: hunger/thirst/fatigue/panic 0..1 (1=critical). hp 0..100. zClose=zombies within 10 tiles (DANGER), zNear=within 30. zDist/zDir=nearest zombie's distance & compass dir. qlen>0=body still acting. foods=safe edible food count; waters=pure clean water count in inventory. items lists only the first12 inventory names; inventoryCount covers all items. weapon=primary hand item, not proof of a usable weapon. room=where you are. nearbyLoot reports loaded container contents within4 tiles; useful=false means LOOT has no desired supply/weapon there. It does not promise path access or line of sight. actionOutcome reports LOOT/EAT/DRINK evidence: observed_effect means inventory additions or reduced hunger/thirst were observed after the action; no_effect/unverified/interrupted do not establish success. Queue-empty and lastSeq alone do not prove success. bldgDir/bldgDist=compass dir & tile distance to the nearest BUILDING (loot + shelter); "none" means only wilderness around you. Map: +x East, +y South (North = -dy).
 
 ACTIONS (one per turn):
   MOVE dx dy — one nonzero integer offset, radius <=4 tiles. No momentum or automatic continuation.
-  LOOT        — walk to the nearest stocked container (within 4 tiles) and grab food/water/useful items. Use often — it's how you get fed and armed.
+  LOOT        — prioritize safe food/pure water across nearby containers (within4 tiles), else one useful weapon when unarmed. No household junk fallback. Check nearbyLoot and actionOutcome; do not repeat failed looting without a changed position or supply observation.
   EAT / DRINK — consume food / water from inventory (check foods>0 / waters>0).
   EQUIP       — equip your best weapon from inventory (do this once you loot one).
   CLOSEDOOR   — close the nearest open door (barrier between you and zombies as you retreat).
@@ -179,10 +190,10 @@ SURVIVAL DOCTRINE (you keep dying — follow this hard):
 - Fight only ONE zombie, only when armed, only with room to back up — otherwise MOVE away. The reflex will swing for you when one's adjacent; don't seek fights.
 - Loot fast and leave: grab weapon/food/water from a clear building, then move on before more gather.
 - DON'T wander into empty forest — there's nothing to loot there and you'll get lost. If bldgDir isn't "none", head toward it (that's where buildings/loot/shelter are).
-- If bldgDir=="HERE" or bldgDist is small (under ~8), you ARE at a building — STOP running and LOOT it. Don't keep searching for a building when you're standing at one. Only move on once you've looted it or it's empty/dangerous.
+- If inside a safe building, check nearbyLoot.useful before LOOT. If no useful supplies are in range, take a short safe step toward another room; don't repeat LOOT on empty or clutter-only containers. After no_effect or an access error, change your approach before retrying.
 - Locked building with loot? BREAKIN (smash a window and climb through) rather than moving on.
 - When you decide to hole up / rest / hide inside, CONCEAL first (closes doors + curtains so zombies don't see you), then WAIT.
-- NIGHT (hour < 7 or >= 20) is dangerous — you see poorly in the dark and it's easy to get lost or ambushed. Prefer to be holed up and concealed at night. A light lets you see but can draw attention; the body auto-manages a flashlight.
+- NIGHT (hour < 7 or >= 20) is dangerous — you see poorly in the dark and it's easy to get lost or ambushed. Prefer to be holed up and concealed at night. Human input controls flashlight and sneaking settings.
 
 PACING: choose short purposeful steps (1-4 tiles total radius). Wait for actions to finish and inspect the result before choosing another. WAIT is appropriate while sheltering or when no useful supported action is safe.
 
@@ -220,6 +231,7 @@ async function decide() {
   eulogized = false;
   if (!lab.ready(percept)) { brainNote = 'waiting for explicitly armed lab session'; return; }
   if (percept.qlen > 0) { brainNote = 'waiting for the current timed action queue'; return; }
+  if (percept.actionOutcome?.status === 'pending') { brainNote = 'waiting for inventory or needs evidence'; return; }
   if (!lab.beginRequest(percept)) { if (lab.stopped) void finishRun(lab.reason); return; }
 
   inFlight = true;
@@ -306,7 +318,7 @@ Advance your subtask toward your goal. STRICT JSON only.`;
       // complete. Queue completion is not an action-success receipt.
       const deadline = Date.now() + 10000;
       while (!closing && Date.now() < deadline && !lab.expired()) {
-        if (readPercept() && percept.lastSeq >= state.seq && percept.qlen === 0) break;
+        if (readPercept() && percept.lastSeq >= state.seq && percept.qlen === 0 && percept.actionOutcome?.status !== 'pending') break;
         await new Promise(resolve => setTimeout(resolve, 50));
       }
       if (!closing) await finishRun('request_budget_exhausted');

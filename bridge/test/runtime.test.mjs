@@ -12,6 +12,34 @@ import { setTimeout as delay } from 'node:timers/promises';
 const bridgeFile=fileURLToPath(new URL('../pz-bridge.mjs',import.meta.url));
 const clockFixture=fileURLToPath(new URL('../test-support/clock.cjs',import.meta.url));
 
+test('pending evidence settles before cleanup and receipts retain their original identity',{timeout:8000},async t=>{
+  const run=temporaryRun(t);const game=fakeGame(run);
+  const origin={world:'fixture-world',actor:'0',session:'fixture-session'};
+  const endpoint=await model(run,(_req,res)=>{
+    game.state.actionOutcome={...origin,seq:1,action:'LOOT',status:'pending',added:0};game.publish();
+    reply(res,{action:{type:'LOOT'}});
+  });
+  const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_REQUESTS:'1'});
+  await boot(processRun);await waitFor(()=>game.state.lastSeq===1,()=>processRun.output());
+  await delay(350);assert.equal(run.child.exitCode,null,'bridge stopped before pending evidence settled');
+  assert.equal(endpoint.calls.length,1);
+  game.state.actionOutcome={...origin,seq:1,action:'LOOT',status:'observed_effect',added:1,hungerDrop:0,thirstDrop:0};game.publish();
+  const[code]=await processRun.exited;assert.equal(code,0);
+  const state=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
+  assert.equal(state.disarmObserved,true);assert.equal(state.outcomes.length,1);
+  assert.equal(state.outcomes[0].session,origin.session);
+  assert.equal(state.outcomes[0].world,origin.world);assert.equal(state.outcomes[0].actor,origin.actor);
+  assert.equal(state.outcomes[0].added,1);assert.equal(state.finalObservation.session,'fixture-stopped');
+});
+
+test('unresolved existing evidence prevents a gameplay model request',{timeout:4000},async t=>{
+  const run=temporaryRun(t);fakeGame(run,{actionOutcome:{seq:1,action:'DRINK',status:'pending'}});
+  const endpoint=await model(run,(_req,res)=>reply(res));
+  const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_SECONDS:'1'});
+  const[code]=await processRun.exited;assert.equal(code,0);assert.equal(endpoint.calls.length,0);
+  assert.equal(fs.existsSync(path.join(run.luaDir,'claude_intent.txt')),false);
+});
+
 function temporaryRun(t) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'pz-runtime-'));
   const luaDir=path.join(root,'Lua');fs.mkdirSync(luaDir);

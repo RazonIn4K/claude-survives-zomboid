@@ -93,7 +93,10 @@ local function vector(items) return {size=function() return #items end,get=funct
 local function event(name) handlers[name]={}; return {Add=function(fn) table.insert(handlers[name],fn) end} end
 Events={OnTick=event("tick"),OnKeyPressed=event("key"),OnMouseDown=event("mouse"),OnRightMouseDown=event("right"),
     OnGameStart=event("start"),OnCreatePlayer=event("create")}
-require=function(name) assert(name=="ClaudeLabControl") end
+require=function(name)
+    assert(name=="ClaudeLabControl" or name=="ClaudeLootPolicy" or name=="ClaudeActionEvidence")
+    if name~="ClaudeLabControl" then dofile(directory.."/"..name..".lua") end
+end
 ISUIElement={derive=function() return {} end}
 Keyboard={KEY_H=35}
 getTimestampMs=function() return clock end
@@ -105,25 +108,44 @@ getFileReader=function(name)
     return {readLine=function() return files[name] end,close=function() end}
 end
 CharacterStat={HUNGER=1,THIRST=2,FATIGUE=3,ENDURANCE=4,PANIC=5}
+Fluid={Water="water"}
+instanceof=function(item,kind) return item and item.kind==kind or false end
 getGameTime=function() return {getHour=function() return 21 end,getNightsSurvived=function() return 0 end} end
 local light={getDisplayName=function() return "fixture light" end,IsFood=function() return false end,
-    getFluidContainer=function() return nil end,getLightStrength=function() return 1 end,setActivated=function() effect("light") end}
+    getID=function() return 1 end,getFluidContainer=function() return nil end,
+    getLightStrength=function() return 1 end,setActivated=function() effect("light") end}
+local inventoryItems, statValues, squares, walkAllowed, walkTarget = {light}, {}, {}, true, nil
+local inventory={getItems=function() return vector(inventoryItems) end}
 player={getX=function() return 100.5 end,getY=function() return 100.5 end,getZ=function() return 0 end,
-    getStats=function() return {get=function() return 0 end} end,isDead=function() return false end,
+    getStats=function() return {get=function(_,stat) return statValues[stat] or 0 end} end,isDead=function() return false end,
     getOnlineID=function() return 0 end,isOutside=function() return false end,
     getBodyDamage=function() return {getOverallBodyHealth=function() return 100 end} end,
-    getInventory=function() return {getItems=function() return vector({light}) end} end,
+    getInventory=function() return inventory end,isKnownPoison=function(_,item) return item.poison or false end,
     getSquare=function() return {getRoom=function() return nil end} end,getPrimaryHandItem=function() return nil end,
     Say=function() effect("say") end,setSneaking=function() effect("sneak") end,
     faceLocation=function() effect("face") end,faceThisObject=function() effect("face") end,
     DoAttack=function() effect("attack") end,pressedMovement=function() return false end,pressedCancelAction=function() return false end}
 getSpecificPlayer=function() return player end
+local function square(x,y,z,objects)
+    return {getX=function() return x end,getY=function() return y end,getZ=function() return z end,
+        getObjects=function() return vector(objects or {}) end,getBuilding=function() return nil end}
+end
 getCell=function() return {getZombieList=function() return vector(zombies) end,
-    getGridSquare=function(_,x,y,z) return {getX=function() return x end,getY=function() return y end,getZ=function() return z end,
-        getObjects=function() return vector({}) end,getBuilding=function() return nil end} end} end
+    getGridSquare=function(_,x,y,z) return squares[x..":"..y..":"..z] or square(x,y,z) end} end
 ISTimedActionQueue={getTimedActionQueue=function() return {queue=queue} end,
     add=function(action) queue[#queue+1]=action; effect("queue") end,clear=function() queue={}; effect("clear") end}
-ISWalkToTimedAction={new=function(_,_,square) return {square=square} end}
+ISWalkToTimedAction={new=function(_,_,target) return {kind="walk",square=target} end}
+ISInventoryTransferAction={new=function(_,_,item,source,destination)
+    return {kind="transfer",item=item,source=source,destination=destination}
+end}
+ISEatFoodAction={new=function(_,_,item) return {kind="eat",item=item} end}
+ISDrinkFluidAction={new=function(_,_,item) return {kind="drink",item=item} end}
+luautils={walkAdj=function(p,target,keepActions)
+    assert(p==player and keepActions==true,"loot must preserve explicitly managed action queue")
+    effect("walkAdj");walkTarget=target
+    if not walkAllowed then return false end
+    ISTimedActionQueue.add(ISWalkToTimedAction:new(p,target));return true
+end}
 getGameSpeed=function() return 1 end
 setGameSpeed=function() error("the lab must never change game speed") end
 dofile(directory.."/ClaudeSurvivor.lua")
@@ -169,4 +191,133 @@ assert(#queue==1 and files["claude_percept.json"]:find('"stopFailed":true',1,tru
 assert(files["claude_percept.json"]:find('"armed":false',1,true))
 ISTimedActionQueue.clear=normalClear
 count=count+1;print("ok whole-body queue clear failure is reported without resuming autonomy")
+
+-- Exercise the actual body dispatch and serialized observations, not just helpers.
+local function freshBody()
+    files, handlers, queue, effects, zombies = {}, {}, {}, {}, {}
+    inventoryItems, statValues, squares, walkAllowed, walkTarget = {light}, {}, {}, true, nil
+    Events={OnTick=event("tick"),OnKeyPressed=event("key"),OnMouseDown=event("mouse"),OnRightMouseDown=event("right"),
+        OnGameStart=event("start"),OnCreatePlayer=event("create")}
+    dofile(directory.."/ClaudeSurvivor.lua");tick()
+    session=assert(percept("session"));heartbeat();tick()
+    assert(files["claude_percept.json"]:find('"armed":true',1,true))
+end
+local function bodyTest(name,fn)
+    freshBody();fn();count=count+1;print("ok whole-body "..name)
+end
+local function advance(n)
+    for _=1,n or 1 do heartbeat();tick() end
+end
+local function command(action,seq)
+    seq=seq or 1
+    files["claude_intent.txt"]=table.concat({seq,action,0,0,"","","","LAB1",session,"fixture-world","0","body-test-token",clock,clock+2000},"|")
+    advance(45)
+    assert(files["claude_percept.json"],"body did not publish a percept")
+end
+local function fixtureItem(id,kind,options)
+    options=options or {}
+    return {kind=kind,poison=options.poison,getID=function() return id end,
+        getDisplayName=function() return "item-"..id end,
+        getHungChange=function() return options.hungerChange or -0.2 end,
+        getScriptItem=function() return {isCantEat=function() return options.cantEat or false end} end,
+        isBurnt=function() return options.burnt or false end,isRotten=function() return options.rotten or false end,
+        isbDangerousUncooked=function() return options.rawDanger or false end,isCooked=function() return options.cooked or false end,
+        getCondition=function() return options.condition or 10 end,
+        getFluidContainer=function()
+            if not options.water and not options.mixed then return nil end
+            return {isEmpty=function() return options.empty or false end,
+                isPureFluid=function(_,fluid) return fluid==Fluid.Water and options.water==true and not options.mixed end}
+        end}
+end
+local function stocked(x,y,items)
+    local container={getItems=function() return vector(items) end}
+    local object={getContainerCount=function() return 1 end,getContainerByIndex=function(_,index)
+        assert(index==0);return container
+    end}
+    local target=square(x,y,0,{object});squares[x..":"..y..":0"]=target
+    return container,target
+end
+local function outcome(field)
+    local value=assert(files["claude_percept.json"]):match('"actionOutcome":({.-})')
+    assert(value,"body did not serialize an action outcome")
+    return value:match('"'..field..'":"([^"]*)"') or tonumber(value:match('"'..field..'":([%d%.%-]+)'))
+end
+bodyTest("loot prefers farther clean water over nearest junk and queues each item once",function()
+    stocked(101,100,{fixtureItem(10,"Junk")})
+    local water=fixtureItem(11,"WaterBottle",{water=true})
+    local useful,target=stocked(104,100,{water,water})
+    statValues[CharacterStat.THIRST]=0.7
+    command("LOOT")
+    assert(walkTarget==target and #queue==2,"loot chose clutter or queued a duplicate transfer")
+    assert(queue[2].kind=="transfer" and queue[2].item==water and queue[2].source==useful)
+end)
+bodyTest("loot hunger priority chooses safe food over a nearer water container",function()
+    stocked(101,100,{fixtureItem(12,"WaterBottle",{water=true})})
+    local food=fixtureItem(13,"Food")
+    local useful,target=stocked(103,100,{food})
+    statValues[CharacterStat.HUNGER],statValues[CharacterStat.THIRST]=0.7,0.2
+    command("LOOT")
+    assert(walkTarget==target and #queue==2 and queue[2].item==food and queue[2].source==useful)
+end)
+bodyTest("loot excludes unsafe food and mixed or empty water containers",function()
+    stocked(101,100,{fixtureItem(14,"Food",{rotten=true}),fixtureItem(15,"Food",{burnt=true}),
+        fixtureItem(16,"Food",{poison=true}),fixtureItem(17,"Food",{rawDanger=true}),
+        fixtureItem(18,"Food",{cantEat=true}),fixtureItem(19,"WaterBottle",{water=true,mixed=true}),
+        fixtureItem(20,"WaterBottle",{water=true,empty=true})})
+    command("LOOT");advance(60)
+    assert(#queue==0 and not effects.walkAdj and not walkTarget)
+    assert(files["claude_percept.json"]:find('"nearbyLoot":{"valid":true,"containers":1,"foods":0,"waters":0,"weapons":0,"useful":false}',1,true))
+end)
+bodyTest("failed walkAdj does not queue transfers or a fallback walk",function()
+    stocked(101,100,{fixtureItem(21,"WaterBottle",{water=true})});walkAllowed=false
+    command("LOOT");advance(60)
+    assert(effects.walkAdj==1 and #queue==0 and not effects.queue)
+    assert(percept("err")=="loot: no adjacent route")
+end)
+bodyTest("empty loot queue without a transfer reports no effect",function()
+    stocked(101,100,{fixtureItem(22,"WaterBottle",{water=true})})
+    command("LOOT");assert(#queue==2);queue={};advance(140)
+    assert(outcome("status")=="no_effect" and outcome("added")==0)
+end)
+bodyTest("loot receipts use inventory IDs and require an actual new ID",function()
+    stocked(101,100,{fixtureItem(23,"WaterBottle",{water=true})})
+    command("LOOT");queue={}
+    inventoryItems={fixtureItem(1,"Junk")};advance(35)
+    -- A replacement engine object for the same network inventory ID is not a gain.
+    assert(not files["claude_percept.json"]:find('"status":"observed_effect"',1,true))
+    inventoryItems[#inventoryItems+1]=fixtureItem(23,"WaterBottle",{water=true});advance(60)
+    assert(outcome("status")=="observed_effect" and outcome("added")==1)
+end)
+bodyTest("eat receipts need a real hunger decrease after the food action",function()
+    inventoryItems[#inventoryItems+1]=fixtureItem(24,"Food")
+    statValues[CharacterStat.HUNGER],statValues[CharacterStat.THIRST]=0.4,0.5
+    command("EAT");assert(#queue==1 and queue[1].kind=="eat")
+    queue={};statValues[CharacterStat.HUNGER]=0.25;advance(60)
+    assert(outcome("status")=="observed_effect" and math.abs(outcome("hungerDrop")-0.15)<0.000001)
+end)
+bodyTest("drink receipts need a real thirst decrease after the drink action",function()
+    inventoryItems[#inventoryItems+1]=fixtureItem(25,"WaterBottle",{water=true})
+    statValues[CharacterStat.HUNGER],statValues[CharacterStat.THIRST]=0.4,0.5
+    command("DRINK");assert(#queue==1 and queue[1].kind=="drink")
+    queue={};statValues[CharacterStat.THIRST]=0.2;advance(60)
+    assert(outcome("status")=="observed_effect" and math.abs(outcome("thirstDrop")-0.3)<0.000001)
+end)
+bodyTest("manual takeover marks pending loot interrupted rather than completed",function()
+    stocked(101,100,{fixtureItem(26,"WaterBottle",{water=true})})
+    command("LOOT");assert(#queue==2)
+    for _,fn in ipairs(handlers.mouse) do fn() end
+    advance(60)
+    assert(#queue==0 and outcome("status")=="interrupted" and outcome("detail")=="control_revoked")
+    assert(outcome("session")==session and percept("session")~=session,
+        "receipt was relabelled as belonging to the replacement session")
+    assert(files["claude_percept.json"]:find('"armed":false',1,true))
+end)
+bodyTest("reflex replacement interrupts partial loot and cannot later claim completion",function()
+    local water=fixtureItem(27,"WaterBottle",{water=true})
+    stocked(101,100,{water});command("LOOT");assert(#queue==2)
+    inventoryItems[#inventoryItems+1]=water
+    zombies={{getX=function() return 101 end,getY=function() return 100 end}}
+    advance(5);zombies={};queue={};advance(100)
+    assert(outcome("status")=="interrupted" and outcome("detail")=="movement_replaced_action")
+end)
 print("passed "..count.." lab Lua tests")

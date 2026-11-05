@@ -34,7 +34,26 @@ is disabled, and this fork never changes game speed or automatic sneak/light
 settings. Initial ARM refuses a pre-existing timed-action queue; lease renewal
 can continue while the controller's own actions are queued. Existing local reflex,
 loot, eating, drinking, equipment and concealment functions run only while the
-lease is armed. Runtime success of those engine calls still needs a playtest.
+lease is armed. The earlier bounded multiplayer run observed actual looting and
+screwdriver equip; eating, drinking and combat still need runtime validation.
+
+`bodyRevision="supplies-1"` identifies the current body update. LOOT ranks nearby
+safe edible food and pure clean water ahead of a single useful weapon fallback;
+it does not fill inventory with household clutter. Food checks match the official
+B42 inventory pane, including known poison and unsafe raw food checks. Unknown
+or hidden hazards can still exist. Nearby contents are proximity observations,
+not proof of visibility or an accessible route. `nearbyLoot` exposes these counts;
+`inventoryCount` covers all items while the legacy names list remains capped at12.
+
+LOOT/EAT/DRINK publish `actionOutcome` with their original world/actor/session.
+`observed_effect` requires a new full-inventory item ID or the matching raw
+hunger/thirst reduction after the queue settles. `no_effect` follows an empty
+queue without an observed delta after a one-second synchronization grace;
+`interrupted` records takeover/reflex replacement; `unverified` records missing
+evidence or a30-second timeout. These receipts report observed changes, not proof
+of causation or that every requested transfer completed. The bridge waits for
+pending evidence before another decision and stores terminal receipts in
+`state.outcomes`. A final command remains subject to the ten-second/overall cap.
 
 **Any key or mouse input permanently disarms and rotates the session.** Idle
 input never automatically resumes the AI. Exit the stopped bridge and explicitly

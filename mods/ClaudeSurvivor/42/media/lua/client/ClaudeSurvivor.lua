@@ -28,6 +28,9 @@ local observing = false   -- true while the AI is deliberately holding to look a
 
 -- Safe-default player-client lab lease. No Lua autonomy runs before explicit arming.
 require "ClaudeLabControl"
+require "ClaudeLootPolicy"
+require "ClaudeActionEvidence"
+local actionEvidence = ClaudeActionEvidence.new()
 local lab = ClaudeLabControl.new({
   now = function() return tonumber(getTimestampMs()) end,
   random = function() return ZombRand(1000000) end,
@@ -48,6 +51,7 @@ local lab = ClaudeLabControl.new({
     return not ok or busy
   end,
   stop = function(p)
+    actionEvidence:cancel("control_revoked")
     travel.active, travel.budget, observing = false, 0, false
     if not p then return false end
     local ok, empty = pcall(function()
@@ -85,19 +89,96 @@ local function split(s, sep)
 end
 
 -- ---------- item classification ----------
-local function isFoodItem(it)
-  local food = false
-  pcall(function() if it:IsFood() then food = true end end)
-  if not food then pcall(function() if it:getCategory() == "Food" then food = true end end) end
-  return food
+local function isFoodItem(it, p)
+  -- Match the official B42 inventory pane's edible-food checks; unknown APIs fail closed.
+  local ok, food = pcall(function()
+    return instanceof(it, "Food") and it:getHungChange() < 0
+      and not it:getScriptItem():isCantEat() and not it:isBurnt() and not it:isRotten()
+      and not p:isKnownPoison(it) and not (it:isbDangerousUncooked() and not it:isCooked())
+  end)
+  return ok and food or false
 end
 local function isWaterItem(it)
   local ok, water = pcall(function()
     local fc = it:getFluidContainer()
-    if fc and (not fc:isEmpty()) and fc:contains(Fluid.Water) and not fc:contains(Fluid.TaintedWater) then return true end
+    if fc and (not fc:isEmpty()) and fc:isPureFluid(Fluid.Water) then return true end
     return false
   end)
   return ok and water or false
+end
+
+local function isWeaponItem(it)
+  local ok, weapon = pcall(function() return instanceof(it, "HandWeapon") and it:getCondition() > 0 end)
+  return ok and weapon or false
+end
+
+local function inventorySnapshot(p)
+  local snapshot = {now = tonumber(getTimestampMs()), valid = false, items = {},
+    world=lab.world, actor=lab.actor, session=lab.session}
+  local ok = pcall(function()
+    local items = p:getInventory():getItems()
+    for i = 0, items:size() - 1 do
+      local it, id = items:get(i), nil
+      pcall(function() id = it:getID() end)
+      snapshot.items[id ~= nil and ("id:" .. tostring(id)) or it] = true
+    end
+    snapshot.hunger = p:getStats():get(CharacterStat.HUNGER)
+    snapshot.thirst = p:getStats():get(CharacterStat.THIRST)
+  end)
+  snapshot.valid = ok
+  return snapshot
+end
+
+-- Loaded containers within the existing four-tile Manhattan limit. This is proximity
+-- information, not a promise of line of sight, access, or a successful transfer.
+local function scanLoot(p)
+  local px, py, pz = math.floor(p:getX()), math.floor(p:getY()), math.floor(p:getZ())
+  local candidates, seen = {}, {}
+  local summary = {containers=0, foods=0, waters=0, weapons=0, valid=true}
+  local ok = pcall(function()
+    for dx = -4, 4 do for dy = -4, 4 do
+      local distance = math.abs(dx) + math.abs(dy)
+      if distance <= 4 then
+        local sq = getCell():getGridSquare(px+dx, py+dy, pz)
+        local objects = sq and sq:getObjects()
+        if objects then for oi = 0, objects:size()-1 do
+          local object = objects:get(oi)
+          local containers = {}
+          pcall(function()
+            for ci = 0, object:getContainerCount()-1 do
+              table.insert(containers, object:getContainerByIndex(ci))
+            end
+          end)
+          if #containers == 0 then pcall(function()
+            local c = object:getContainer(); if c then table.insert(containers, c) end
+          end) end
+          for _, container in ipairs(containers) do if not seen[container] then
+            seen[container] = true
+            local candidate = {distance=distance, dx=dx, dy=dy, square=sq, container=container, items={}}
+            local items = container:getItems()
+            for ii = 0, items:size()-1 do
+              local it = items:get(ii)
+              local food, water, weapon = isFoodItem(it,p), isWaterItem(it), isWeaponItem(it)
+              table.insert(candidate.items, {item=it, food=food, water=water, weapon=weapon})
+              if food then summary.foods=summary.foods+1 end
+              if water then summary.waters=summary.waters+1 end
+              if weapon then summary.weapons=summary.weapons+1 end
+            end
+            summary.containers=summary.containers+1
+            table.insert(candidates, candidate)
+          end end
+        end end
+      end
+    end end
+  end)
+  if not ok then return {}, {containers=0,foods=0,waters=0,weapons=0,valid=false} end
+  return candidates, summary
+end
+
+local function lootNeeds(p)
+  local hunger, thirst = p:getStats():get(CharacterStat.HUNGER), p:getStats():get(CharacterStat.THIRST)
+  return {food=true,water=true,weapon=not isWeaponItem(p:getPrimaryHandItem()),
+    prefer=thirst > hunger and "water" or "food"}
 end
 
 -- ---------- zombie awareness ----------
@@ -166,12 +247,13 @@ local function buildPercept(p)
     if r and r:getName() then room = r:getName() end
   end)
 
-  local foods, waters, names = 0, 0, {}
+  local foods, waters, names, inventoryCount = 0, 0, {}, 0
   pcall(function()
     local items = p:getInventory():getItems()
+    inventoryCount = items:size()
     for i = 0, items:size() - 1 do
       local it = items:get(i)
-      if isFoodItem(it) then foods = foods + 1 end
+      if isFoodItem(it,p) then foods = foods + 1 end
       if isWaterItem(it) then waters = waters + 1 end
       if i < 12 then table.insert(names, esc(it:getDisplayName())) end
     end
@@ -192,6 +274,8 @@ local function buildPercept(p)
   local fatigue = st:get(CharacterStat.FATIGUE)
   local endurance = st:get(CharacterStat.ENDURANCE)
   local panic = st:get(CharacterStat.PANIC)
+  local candidates, nearbyLoot = scanLoot(p)
+  local bestLoot = ClaudeLootPolicy.choose(candidates, lootNeeds(p))
 
   -- feed the HUD (visual transparency)
   HUD.hp, HUD.hunger, HUD.thirst, HUD.fatigue, HUD.panic = hp, hunger, thirst, fatigue, panic
@@ -202,6 +286,7 @@ local function buildPercept(p)
   local j = '{'
   j = j .. '"dead":' .. tostring(p:isDead())
   j = j .. ',"labProtocol":1,"armed":' .. tostring(lab.armed)
+  j = j .. ',"bodyRevision":"supplies-1"'
   j = j .. ',"session":"' .. esc(lab.session or "") .. '","world":"' .. esc(lab.world or "") .. '"'
   j = j .. ',"actor":"' .. esc(lab.actor or "") .. '","labToken":"' .. esc(lab.token or "") .. '"'
   j = j .. ',"observed_ms":' .. string.format("%.0f", tonumber(getTimestampMs()))
@@ -217,6 +302,25 @@ local function buildPercept(p)
   j = j .. ',"zTotal":' .. zTotal .. ',"zNear":' .. zNear .. ',"zClose":' .. zClose
   j = j .. ',"zDist":' .. n2(nearestD) .. ',"zDir":"' .. nearestDir .. '"'
   j = j .. ',"foods":' .. foods .. ',"waters":' .. waters
+  j = j .. ',"inventoryCount":' .. inventoryCount
+  j = j .. ',"nearbyLoot":{"valid":' .. tostring(nearbyLoot.valid)
+    .. ',"containers":' .. nearbyLoot.containers .. ',"foods":' .. nearbyLoot.foods
+    .. ',"waters":' .. nearbyLoot.waters .. ',"weapons":' .. nearbyLoot.weapons
+    .. ',"useful":' .. tostring(bestLoot ~= nil)
+  if bestLoot then
+    j = j .. ',"dx":' .. bestLoot.dx .. ',"dy":' .. bestLoot.dy .. ',"distance":' .. bestLoot.distance
+  end
+  j = j .. '}'
+  local receipt = actionEvidence.receipt
+  if receipt then
+    j = j .. ',"actionOutcome":{"seq":' .. receipt.seq .. ',"action":"' .. esc(receipt.action)
+      .. '","world":"' .. esc(receipt.world) .. '","actor":"' .. esc(receipt.actor)
+      .. '","session":"' .. esc(receipt.session)
+      .. '","status":"' .. esc(receipt.status) .. '","added":' .. (receipt.added or 0)
+      .. ',"hungerDrop":' .. string.format("%.6f",receipt.hungerDrop or 0)
+      .. ',"thirstDrop":' .. string.format("%.6f",receipt.thirstDrop or 0)
+      .. ',"detail":"' .. esc(receipt.detail) .. '"}'
+  end
   j = j .. ',"bldgDir":"' .. bldgDir .. '","bldgDist":' .. bldgDist
   j = j .. ',"weapon":"' .. weapon .. '"'
   j = j .. ',"items":"' .. table.concat(names, ", ") .. '"'
@@ -258,6 +362,7 @@ end
 
 local function doMove(p, dx, dy)
   if not lab.armed then return end
+  actionEvidence:cancel("movement_replaced_action")
   ISTimedActionQueue.clear(p)
   travel.active, travel.budget = false, 0
   stepWalk(p, dx, dy)
@@ -270,9 +375,9 @@ local function doEat(p)
   local items = p:getInventory():getItems()
   for i = 0, items:size() - 1 do
     local it = items:get(i)
-    if isFoodItem(it) then ISTimedActionQueue.add(ISEatFoodAction:new(p, it, 1)); return end
+    if isFoodItem(it,p) then ISTimedActionQueue.add(ISEatFoodAction:new(p, it, 1)); return end
   end
-  lastError = "eat: no food"
+  lastError = "eat: no safe edible food"
 end
 local function doDrink(p)
   local items = p:getInventory():getItems()
@@ -288,58 +393,23 @@ local function doEquip(p)
   if w then ISTimedActionQueue.add(ISEquipWeaponAction:new(p, w, 25, true)) else lastError = "equip: no weapon" end
 end
 local function doLoot(p)
-  local px, py, pz = math.floor(p:getX()), math.floor(p:getY()), math.floor(p:getZ())
-  local best, bestSq, bestD = nil, nil, 99999
-  for dx = -10, 10 do
-    for dy = -10, 10 do
-      local sq = getCell():getGridSquare(px + dx, py + dy, pz)
-      if sq then
-        local objs = sq:getObjects()
-        if objs then
-          for i = 0, objs:size() - 1 do
-            local c = nil
-            pcall(function() c = objs:get(i):getContainer() end)
-            if c then
-              local n = 0; pcall(function() n = c:getItems():size() end)
-              if n > 0 then
-                local d = math.abs(dx) + math.abs(dy)
-                if d <= 4 and d < bestD then bestD, best, bestSq = d, c, sq end
-              end
-            end
-          end
-        end
-      end
-    end
-  end
-  if not best then lastError = "loot: no stocked container within 4 tiles"; return end
-  lastLootTick = tick                       -- protect this loot from interruption (see MOVE handler)
+  local candidates = scanLoot(p)
+  local best, picks = ClaudeLootPolicy.choose(candidates, lootNeeds(p))
+  if not best then lastError = "loot: no useful supplies or weapon within 4 tiles"; return end
+  lastLootTick = tick
   ISTimedActionQueue.clear(p)
-  if not pcall(function() luautils.walkAdj(p, bestSq) end) then ISTimedActionQueue.add(ISWalkToTimedAction:new(p, bestSq)) end
-  local taken, citems, names = 0, best:getItems(), {}
-  for pass = 1, 2 do
-    for i = 0, citems:size() - 1 do
-      if taken >= 6 then break end
-      local it = citems:get(i)
-      local want = (pass == 1) and (isFoodItem(it) or isWaterItem(it)) or (pass == 2 and taken < 3)
-      if want then
-        ISTimedActionQueue.add(ISInventoryTransferAction:new(p, it, best, p:getInventory(), 10))
-        taken = taken + 1
-        local nm = ""
-        pcall(function() nm = it:getDisplayName() end)
-        if nm ~= "" then table.insert(names, nm) end
-      end
-    end
+  -- walkAdj can return false without throwing. Never queue transfers after that failure.
+  local ok, walked = pcall(luautils.walkAdj, p, best.square, true)
+  if not ok or walked ~= true then lastError = "loot: no adjacent route"; return end
+  local names = {}
+  for _, selected in ipairs(picks) do
+    local it = selected.item
+    ISTimedActionQueue.add(ISInventoryTransferAction:new(p, it, best.container, p:getInventory(), 10))
+    pcall(function() table.insert(names, it:getDisplayName()) end)
   end
-  if taken == 0 then
-    lastError = "loot: nothing takeable"
-  else
-    -- honest wording: he's IN THE ACT of taking these (transfers are queued and protected from
-    -- interruption), so say "Grabbing" not "Grabbed" — the words match what's actually happening.
-    local summary = table.concat(names, ", ")
-    HUD.action = "LOOT"
-    HUD.thought = "Grabbing: " .. summary
-    pcall(function() p:Say("Grabbing " .. summary) end)
-  end
+  HUD.action = "LOOT"
+  HUD.thought = "Trying to collect: " .. table.concat(names, ", ")
+
 end
 
 -- close the nearest open door (buys time when fleeing indoors — zombies must thump through)
@@ -457,6 +527,11 @@ local function execIntent(p, line)
   HUD.lastIntentTick = tick
   HUD.seq = seq
 
+  if action == "LOOT" or action == "EAT" or action == "DRINK" then
+    actionEvidence:begin(seq, action, inventorySnapshot(p))
+  else
+    actionEvidence:cancel("superseded_by_" .. action)
+  end
   if action == "MOVE" then
     local px2, py2 = p:getX(), p:getY()
     local qlen = 0
@@ -543,6 +618,7 @@ end
 -- and swing. This runs locally every few ticks (the LLM is too slow to time hits), but it no
 -- longer just cowers: it stands its ground and kills manageable threats.
 local function engage(p, z, d)
+  actionEvidence:cancel("combat_reflex_interrupted_action")
   pcall(function() p:faceThisObject(z) end)
   if d <= 1.8 then
     pcall(function() p:DoAttack(0) end)          -- in range: swing
@@ -613,6 +689,13 @@ local function onTick()
   local active = lab:update(p)
   if not p then return end
   lastSeq = lab.lastSeq
+  if actionEvidence.receipt and actionEvidence.receipt.status == "pending" then
+    local ok, qlen = pcall(function()
+      local q = ISTimedActionQueue.getTimedActionQueue(p)
+      return q and q.queue and #q.queue or -1
+    end)
+    actionEvidence:update(inventorySnapshot(p), ok and qlen or -1, tonumber(getTimestampMs()))
+  end
   if lab.changed or tick % PERCEPT_EVERY == 0 then
     writePercept(p); lab.changed = false
   end
