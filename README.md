@@ -11,6 +11,11 @@
 > decrease; positive drinking and combat remain unverified. The current update
 > prioritizes safe food and pure water, omits junk fallback, and reports
 > inventory/needs evidence for LOOT/EAT/DRINK. See [lab results](docs/LAB-PLAYTEST.md).
+>
+> **Offline survival update:** `survival-1` adds complete/partial injury facts,
+> native-action busy state and conservative adjacent window traversal. BREAKIN
+> never smashes or walks to a window. These changes have fixture coverage and
+> source review; their actual multiplayer behavior still needs validation.
 
 <div align="center">
 

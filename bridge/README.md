@@ -54,9 +54,8 @@ screwdriver equip. A subsequent scripted check collected three food items and
 consumed one with an observed hunger reduction. Positive drinking and combat
 remain untested. See [the bounded lab results](../docs/LAB-PLAYTEST.md).
 
-`bodyRevision="continuous-1"` identifies the current body update, including removal
-of the former five-minute body lifetime. Renewed short leases can now continue
-without an absolute body cutoff. LOOT ranks nearby
+`bodyRevision="survival-1"` identifies the current body update. Renewed short
+leases can continue without an absolute body cutoff. LOOT ranks nearby
 safe edible food and pure clean water ahead of a single useful weapon fallback;
 it does not fill inventory with household clutter. Food checks match the official
 B42 inventory pane, including known poison and unsafe raw food checks. Unknown
@@ -66,6 +65,27 @@ container lists can be empty while their actual contents remain unknown; a zero
 count does not establish an empty container or house. The current body does not
 request all container contents itself. `nearbyLoot` exposes these client counts;
 `inventoryCount` covers all items while the legacy names list remains capped at12.
+
+`health` reports read-only body-part facts, bandage/bleeding/glass counts and
+urgency. Complete observations require every expected unique body-part ID;
+missing APIs, unreadable parts or a truncated enumeration remain unknown or
+partial. It does not diagnose the cause of every health decrease, reveal hidden
+infection state or add treatment actions. The HUD and dashboard show whether
+the body check is complete.
+
+`qlen=-1` means the Lua queue could not be read. `nativeBusy` independently
+reports the game's action/traversal state and is `null` when unreadable.
+Unknown state and native activity block new model work. Disarm confirmation
+requires both an empty Lua queue and observed native inactivity; a queue clear
+alone cannot claim that an already-started Java traversal ended.
+
+The legacy `BREAKIN` intent now only tries an already-adjacent, same-floor,
+open or fully glass-cleared window with a supported landing and no observed
+floor glass or barricade. It never smashes, removes glass, walks or clears the
+queue. The guarded vanilla action rechecks controller identity/lease and live
+hazards before execution. Queue acceptance must be confirmed. Unsafe or unknown
+conditions return explicit blockers. These policies are source-reviewed and
+fixture-tested; actual multiplayer window execution remains unverified.
 
 LOOT/EAT/DRINK publish `actionOutcome` with their original world/actor/session.
 `observed_effect` requires a new full-inventory item ID or the matching raw

@@ -30,6 +30,21 @@ local observing = false   -- true while the AI is deliberately holding to look a
 require "ClaudeLabControl"
 require "ClaudeLootPolicy"
 require "ClaudeActionEvidence"
+require "ClaudeHealthFacts"
+require "ClaudeWindowPolicy"
+local function readActionState(p)
+  local count, nativeBusy, traversing = -1, nil, nil
+  pcall(function()
+    local q = ISTimedActionQueue.getTimedActionQueue(p)
+    if q and type(q.queue) == "table" then count = #q.queue end
+  end)
+  pcall(function()
+    local value = ISTimedActionQueue.isPlayerDoingAction(p)
+    if type(value) == "boolean" then nativeBusy = value end
+  end)
+  pcall(function() traversing = p:getCurrentState() == ClimbThroughWindowState.instance() end)
+  return count, nativeBusy, traversing
+end
 local actionEvidence = ClaudeActionEvidence.new()
 local lab = ClaudeLabControl.new({
   now = function() return tonumber(getTimestampMs()) end,
@@ -44,11 +59,8 @@ local lab = ClaudeLabControl.new({
     return ok and line or nil
   end,
   busy = function(p)
-    local ok, busy = pcall(function()
-      local q = ISTimedActionQueue.getTimedActionQueue(p)
-      return q and q.queue and #q.queue > 0 or false
-    end)
-    return not ok or busy
+    local count, nativeBusy = readActionState(p)
+    return count < 0 or nativeBusy ~= false or count > 0
   end,
   stop = function(p)
     actionEvidence:cancel("control_revoked")
@@ -56,8 +68,8 @@ local lab = ClaudeLabControl.new({
     if not p then return false end
     local ok, empty = pcall(function()
       ISTimedActionQueue.clear(p)
-      local q = ISTimedActionQueue.getTimedActionQueue(p)
-      return q and q.queue and #q.queue == 0 or false
+      local count, nativeBusy = readActionState(p)
+      return count == 0 and nativeBusy == false
     end)
     return ok and empty
   end,
@@ -69,7 +81,7 @@ local HUD = {
   hp = 100, hunger = 0, thirst = 0, fatigue = 0, panic = 0,
   zNear = 0, zClose = 0, zDist = -1, zDir = "-",
   foods = 0, waters = 0, weapon = "none", room = "", qlen = 0, day = 0, hour = 0,
-  lastIntentTick = -9999, seq = 0, visible = true,
+  lastIntentTick = -9999, seq = 0, visible = true, injury = "Body check: unknown",
 }
 
 local function esc(s)
@@ -262,8 +274,8 @@ local function buildPercept(p)
   local weapon = "none"
   pcall(function() local w = p:getPrimaryHandItem(); if w then weapon = esc(w:getDisplayName()) end end)
 
-  local qlen = 0
-  pcall(function() local q = ISTimedActionQueue.getTimedActionQueue(p); if q and q.queue then qlen = #q.queue end end)
+  local qlen, nativeBusy, traversing = readActionState(p)
+  local health = ClaudeHealthFacts.read(p)
 
   local hour, day = 0, 0
   pcall(function() hour = getGameTime():getHour() end)
@@ -282,11 +294,17 @@ local function buildPercept(p)
   HUD.zNear, HUD.zClose, HUD.zDist, HUD.zDir = zNear, zClose, nearestD, nearestDir
   HUD.foods, HUD.waters, HUD.weapon, HUD.room = foods, waters, weapon, room
   HUD.qlen, HUD.day, HUD.hour = qlen, day, hour
+  local injuries = health.summary or {}
+  HUD.injury = health.valid and "Body check: observed" or "Body check: incomplete"
+  if health.observedParts and health.observedParts > 0 then
+    HUD.injury = HUD.injury .. " | " .. tostring(injuries.bleedingParts or 0)
+      .. " bleeding, " .. tostring(injuries.glassParts or 0) .. " glass"
+  end
 
   local j = '{'
   j = j .. '"dead":' .. tostring(p:isDead())
   j = j .. ',"labProtocol":1,"armed":' .. tostring(lab.armed)
-  j = j .. ',"bodyRevision":"continuous-1"'
+  j = j .. ',"bodyRevision":"survival-1"'
   j = j .. ',"session":"' .. esc(lab.session or "") .. '","world":"' .. esc(lab.world or "") .. '"'
   j = j .. ',"actor":"' .. esc(lab.actor or "") .. '","labToken":"' .. esc(lab.token or "") .. '"'
   j = j .. ',"observed_ms":' .. string.format("%.0f", tonumber(getTimestampMs()))
@@ -297,6 +315,8 @@ local function buildPercept(p)
   j = j .. ',"outside":' .. tostring(p:isOutside())
   j = j .. ',"room":"' .. esc(room) .. '"'
   j = j .. ',"hp":' .. n2(hp)
+  j = j .. ',"health":' .. ClaudeHealthFacts.toJSON(health)
+  j = j .. ',"capabilities":{"injuryObservation":true,"injuryTreatment":false,"windowSmash":false,"windowTraverse":"adjacent_safe_only","tapDrinking":false}'
   j = j .. ',"hunger":' .. n2(hunger) .. ',"thirst":' .. n2(thirst) .. ',"fatigue":' .. n2(fatigue)
   j = j .. ',"endurance":' .. n2(endurance) .. ',"panic":' .. n2(panic)
   j = j .. ',"zTotal":' .. zTotal .. ',"zNear":' .. zNear .. ',"zClose":' .. zClose
@@ -325,6 +345,8 @@ local function buildPercept(p)
   j = j .. ',"weapon":"' .. weapon .. '"'
   j = j .. ',"items":"' .. table.concat(names, ", ") .. '"'
   j = j .. ',"qlen":' .. qlen
+  j = j .. ',"nativeBusy":' .. (nativeBusy == nil and "null" or tostring(nativeBusy))
+  j = j .. ',"traversingWindow":' .. (traversing == nil and "null" or tostring(traversing))
   j = j .. ',"reflexed":' .. tostring(tick - reflexTick < 600)
   j = j .. ',"lastSeq":' .. lastSeq
   j = j .. ',"err":"' .. esc(lastError) .. '"'
@@ -435,10 +457,11 @@ local function doCloseDoor(p)
   if door then ISTimedActionQueue.add(ISOpenCloseDoor:new(p, door)) else lastError = "closedoor: no open door within 2 tiles" end
 end
 
--- break into a locked building: smash the nearest window and climb through (untouched loot).
+-- Legacy BREAKIN may only traverse an already-open, currently safe adjacent window.
+-- Never smash glass, clear existing work, or blindly append a walk-and-climb chain.
 local function doBreakin(p)
   local px, py, pz = math.floor(p:getX()), math.floor(p:getY()), math.floor(p:getZ())
-  local win = nil
+  local win, blocked = nil, "no adjacent safe window"
   for dx = -2, 2 do
     for dy = -2, 2 do
       local sq = getCell():getGridSquare(px + dx, py + dy, pz)
@@ -448,18 +471,31 @@ local function doBreakin(p)
           local o = objs:get(i)
           local isWin = false
           pcall(function() if instanceof(o, "IsoWindow") then isWin = true end end)
-          if isWin then win = o; break end
+          if isWin then
+            local result = ClaudeWindowPolicy.inspect(p, o)
+            if result.allowed then win = o; break end
+            blocked = result.reason or "window facts unavailable"
+          end
         end
       end
       if win then break end
     end
     if win then break end
   end
-  if not win then lastError = "breakin: no window within 2 tiles"; return end
-  ISTimedActionQueue.clear(p)
-  pcall(function() luautils.walkAdj(p, win:getSquare()) end)
-  pcall(function() ISTimedActionQueue.add(ISSmashWindow:new(p, win)) end)
-  pcall(function() ISTimedActionQueue.add(ISClimbThroughWindow:new(p, win, 0)) end)
+  if not win then lastError = "breakin: " .. tostring(blocked); return end
+  local ownerSession, ownerToken, ownerWorld, ownerActor, ownerSequence = lab.session, lab.token, lab.world, lab.actor, lab.lastSeq
+  local createdAt = tonumber(getTimestampMs())
+  local function authorized()
+    return lab.armed and lab.player == p and getSpecificPlayer(0) == p
+      and lab.session == ownerSession and lab.token == ownerToken and lab.lastSeq == ownerSequence
+      and lab.world == ownerWorld and lab.actor == ownerActor
+      and tostring(getWorld():getWorld()) == ownerWorld and tostring(p:getOnlineID()) == ownerActor
+      and tonumber(getTimestampMs()) >= createdAt and tonumber(getTimestampMs()) <= lab.leaseUntil
+  end
+  local queued, reason = ClaudeWindowPolicy.queue(p, win, nil, function(blocker)
+    lastError = "breakin: " .. tostring(blocker)
+  end, authorized)
+  if not queued then lastError = "breakin: " .. tostring(reason or "window traversal refused") end
 end
 
 -- CONCEAL: hunker down — close every open door and window curtain nearby so he can't be seen
@@ -704,6 +740,14 @@ local function onTick()
     return
   end
   if not announced then announced = true; pcall(function() p:Say("Claude lab armed. Testing survival actions.") end) end
+  -- Java traversal outlives the Lua timed action. Keep observation and explicit
+  -- STOP/takeover handling, but do not add reflexes, movement or facing work.
+  local _, _, traversing = readActionState(p)
+  if traversing ~= false then
+    if tick % PERCEPT_EVERY == 0 then writePercept(p) end
+    if tick % INTENT_EVERY == 0 then pollIntent(p) end
+    return
+  end
   local px, py = p:getX(), p:getY()
 
   -- SURVIVAL first, every ~5 ticks (fight/flee locally — the brain is too slow for this).
@@ -743,7 +787,7 @@ ClaudeHUD = ISUIElement:derive("ClaudeHUD")
 function ClaudeHUD:new()
   local sh = 1080
   pcall(function() sh = getCore():getScreenHeight() end)
-  local h = 182
+  local h = 202
   local o = ISUIElement:new(14, sh - h - 48, 384, h)   -- bottom-left, above the vanilla bars
   setmetatable(o, self); self.__index = self
   return o
@@ -802,6 +846,7 @@ function ClaudeHUD:render()
   self:drawText("Zombies  " .. HUD.zClose .. " close / " .. HUD.zNear .. " near  (" .. zt .. ")", 12, by + 22, 0.9, 0.62, 0.62, 1, UIFont.Small)
   self:drawText("Inv  " .. HUD.foods .. " food, " .. HUD.waters .. " water  |  " .. HUD.weapon, 12, by + 38, 0.7, 0.86, 0.7, 1, UIFont.Small)
   self:drawTextRight("day " .. HUD.day .. "  " .. string.format("%02d", HUD.hour) .. ":00   [H hides]", w - 12, by + 38, 0.55, 0.6, 0.66, 1, UIFont.Small)
+  self:drawText(HUD.injury, 12, by + 56, 0.9, 0.72, 0.62, 1, UIFont.Small)
 end
 
 local hudInstance

@@ -5,7 +5,7 @@ import test from 'node:test';
 import { LabRun, labConfig } from '../lab.mjs';
 
 const fixture = (extra = {}) => ({labProtocol:1,session:'session-1',world:'world-1',actor:'0',
-  labToken:'test-token',armed:true,dead:false,qlen:0,stopFailed:false,observed_ms:1000000,...extra});
+  labToken:'test-token',armed:true,dead:false,qlen:0,nativeBusy:false,stopFailed:false,observed_ms:1000000,...extra});
 const run = (extra = {}) => new LabRun(labConfig({PZ_LAB_ARM:'1',...extra}),{now:()=>1000000,token:'test-token'});
 
 test('managed starts bind the identity observed before launch and never acquire a replacement',()=>{
@@ -179,5 +179,5 @@ test('Lua lab gate and actual body entry point enforce takeover',t=>{
   const result=spawnSync('lua',[script,directory],{encoding:'utf8',timeout:5000});
   if(result.error?.code==='ENOENT') { t.skip('Lua is not installed; gate engine stubs were not run.');return; }
   assert.equal(result.status,0,`${result.stdout}\n${result.stderr}`);
-  assert.match(result.stdout,/passed 26 lab Lua tests/);
+  assert.match(result.stdout,/passed 32 lab Lua tests/);
 });

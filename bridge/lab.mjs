@@ -93,7 +93,7 @@ export class LabRun {
   disarmObserved(percept, issuedAt) {
     return Boolean(this.target && this.valid(percept, { allowDead: true })
       && percept.world === this.target.world && percept.actor === this.target.actor
-      && percept.armed === false && percept.qlen === 0 && percept.stopFailed === false
+      && percept.armed === false && percept.qlen === 0 && percept.nativeBusy === false && percept.stopFailed === false
       && percept.observed_ms >= issuedAt);
   }
 

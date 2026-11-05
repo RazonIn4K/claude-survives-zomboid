@@ -117,7 +117,8 @@ local function event(name) handlers[name]={}; return {Add=function(fn) table.ins
 Events={OnTick=event("tick"),OnKeyPressed=event("key"),OnMouseDown=event("mouse"),OnRightMouseDown=event("right"),
     OnGameStart=event("start"),OnCreatePlayer=event("create")}
 require=function(name)
-    assert(name=="ClaudeLabControl" or name=="ClaudeLootPolicy" or name=="ClaudeActionEvidence")
+    assert(name=="ClaudeLabControl" or name=="ClaudeLootPolicy" or name=="ClaudeActionEvidence"
+        or name=="ClaudeHealthFacts" or name=="ClaudeWindowPolicy")
     if name~="ClaudeLabControl" then dofile(directory.."/"..name..".lua") end
 end
 ISUIElement={derive=function() return {} end}
@@ -138,10 +139,13 @@ local light={getDisplayName=function() return "fixture light" end,IsFood=functio
     getID=function() return 1 end,getFluidContainer=function() return nil end,
     getLightStrength=function() return 1 end,setActivated=function() effect("light") end}
 local inventoryItems, statValues, squares, walkAllowed, walkTarget = {light}, {}, {}, true, nil
+local nativeBusy, traversingWindow = false, false
+ClimbThroughWindowState={instance=function() return "fixture-window-state" end}
 local inventory={getItems=function() return vector(inventoryItems) end}
 player={getX=function() return 100.5 end,getY=function() return 100.5 end,getZ=function() return 0 end,
     getStats=function() return {get=function(_,stat) return statValues[stat] or 0 end} end,isDead=function() return false end,
     getOnlineID=function() return 0 end,isOutside=function() return false end,
+    getCurrentState=function() return traversingWindow and "fixture-window-state" or "fixture-idle-state" end,
     getBodyDamage=function() return {getOverallBodyHealth=function() return 100 end} end,
     getInventory=function() return inventory end,isKnownPoison=function(_,item) return item.poison or false end,
     getSquare=function() return {getRoom=function() return nil end} end,getPrimaryHandItem=function() return nil end,
@@ -156,7 +160,9 @@ end
 getCell=function() return {getZombieList=function() return vector(zombies) end,
     getGridSquare=function(_,x,y,z) return squares[x..":"..y..":"..z] or square(x,y,z) end} end
 ISTimedActionQueue={getTimedActionQueue=function() return {queue=queue} end,
-    add=function(action) queue[#queue+1]=action; effect("queue") end,clear=function() queue={}; effect("clear") end}
+    isPlayerDoingAction=function() return nativeBusy end,
+    hasAction=function(action) for _,candidate in ipairs(queue) do if candidate==action then return true end end;return false end,
+    add=function(action) queue[#queue+1]=action; effect("queue");return {queue=queue} end,clear=function() queue={}; effect("clear") end}
 ISWalkToTimedAction={new=function(_,_,target) return {kind="walk",square=target} end}
 ISInventoryTransferAction={new=function(_,_,item,source,destination)
     return {kind="transfer",item=item,source=source,destination=destination}
@@ -219,6 +225,7 @@ count=count+1;print("ok whole-body queue clear failure is reported without resum
 local function freshBody()
     files, handlers, queue, effects, zombies = {}, {}, {}, {}, {}
     inventoryItems, statValues, squares, walkAllowed, walkTarget = {light}, {}, {}, true, nil
+    nativeBusy, traversingWindow = false, false
     Events={OnTick=event("tick"),OnKeyPressed=event("key"),OnMouseDown=event("mouse"),OnRightMouseDown=event("right"),
         OnGameStart=event("start"),OnCreatePlayer=event("create")}
     dofile(directory.."/ClaudeSurvivor.lua");tick()
@@ -252,6 +259,90 @@ local function fixtureItem(id,kind,options)
                 isPureFluid=function(_,fluid) return fluid==Fluid.Water and options.water==true and not options.mixed end}
         end}
 end
+bodyTest("BREAKIN rejects unchecked windows without clearing work or smashing glass",function()
+    local target=square(100,100,0)
+    local window={kind="IsoWindow",getSquare=function() return target end}
+    squares["100:100:0"]=square(100,100,0,{window})
+    ISSmashWindow={new=function() return {kind="smash"} end}
+    ISClimbThroughWindow={new=function() return {kind="climb"} end}
+    command("BREAKIN");advance(60)
+    assert(#queue==0 and not effects.clear and not effects.queue,
+        "an unchecked window caused a smash, climb or queue mutation")
+    assert(percept("err"):match("^breakin:"),"rejection did not explain the blocked window")
+end)
+bodyTest("unavailable injury APIs are visible as unknown health facts",function()
+    advance(60)
+    local facts=assert(files["claude_percept.json"]):match('"health":({.-})')
+    assert(facts and facts:find('"valid":false',1,true),"missing injury APIs were omitted or reported healthy")
+end)
+bodyTest("observed bleeding reaches the serialized body percept",function()
+    local original=player.getBodyDamage
+    BodyPartType={MAX=17,ToIndex=function(kind) return kind end,
+        ToString=function(kind) return kind==0 and "Hand_L" or "Part_"..kind end}
+    local parts={}
+    for index=0,16 do
+        local id=index
+        parts[#parts+1]={getType=function() return id end,HasInjury=function() return id==0 end,
+            bleeding=function() return id==0 end,scratched=function() return false end,isCut=function() return id==0 end,
+            deepWounded=function() return false end,bitten=function() return false end,
+            haveGlass=function() return false end,bandaged=function() return false end}
+    end
+    player.getBodyDamage=function() return {getOverallBodyHealth=function() return 100 end,
+        getBodyParts=function() return vector(parts) end} end
+    advance(60)
+    player.getBodyDamage=original
+    local text=assert(files["claude_percept.json"])
+    assert(text:find('"health":{"valid":true',1,true) and text:find('"bleedingParts":1',1,true))
+    assert(text:find('"name":"Hand_L"',1,true) and text:find('"urgency":"bleeding"',1,true))
+end)
+bodyTest("safe adjacent traversal rechecks hazards and reports a late blocked window",function()
+    local original=player.getCurrentSquare
+    local a,b=square(100,100,0),square(100,99,0)
+    for _,sq in ipairs({a,b}) do
+        sq.TreatAsSolidFloor=function() return true end;sq.canStand=function() return true end
+        sq.getBrokenGlass=function() return nil end
+    end
+    local window={kind="IsoWindow",open=true,getObjectIndex=function() return 0 end,
+        getSquare=function() return a end,getOppositeSquare=function() return b end,
+        IsOpen=function(self) return self.open end,isDestroyed=function() return false end,
+        isSmashed=function() return false end,isBarricaded=function() return false end,
+        canClimbThrough=function() return true end}
+    a.getObjects=function() return vector({window}) end;squares["100:100:0"]=a
+    player.getCurrentSquare=function() return a end
+    ISClimbThroughWindow={new=function() return {kind="climb",isValid=function() return true end,
+        perform=function() effect("actualClimb") end} end}
+    ISBaseTimedAction={perform=function() table.remove(queue,1) end}
+    command("BREAKIN")
+    assert(#queue==1 and queue[1].kind=="climb" and not effects.clear)
+    window.open=false;queue[1]:perform();advance(60)
+    assert(not effects.actualClimb and #queue==0)
+    assert(percept("err")=="breakin: window_closed_no_smashing","late window rejection was hidden")
+    window.open=true;command("BREAKIN",2);assert(#queue==1)
+    local retained=queue[1];local clear=ISTimedActionQueue.clear
+    ISTimedActionQueue.clear=function() error("synthetic queue-clear failure") end
+    for _,fn in ipairs(handlers.mouse) do fn() end
+    retained:perform();advance(60)
+    ISTimedActionQueue.clear=clear;player.getCurrentSquare=original
+    assert(not effects.actualClimb and #queue==0,"revoked retained climb executed after failed queue cleanup")
+    assert(files["claude_percept.json"]:find('"stopFailed":true',1,true))
+end)
+bodyTest("native window traversal blocks new work and reflexes despite an empty Lua queue",function()
+    nativeBusy,traversingWindow=true,true
+    zombies={{getX=function() return 101 end,getY=function() return 100 end}}
+    command("MOVE");advance(60)
+    assert(#queue==0 and not effects.queue and not effects.attack and not effects.face)
+    assert(percept("err")=="intent:body_busy")
+    assert(files["claude_percept.json"]:find('"qlen":0,"nativeBusy":true,"traversingWindow":true',1,true))
+    command("STOP")
+    assert(effects.clear==1,"explicit STOP was not allowed while native traversal was busy")
+end)
+bodyTest("unreadable action queue remains unknown instead of empty",function()
+    local original=ISTimedActionQueue.getTimedActionQueue
+    ISTimedActionQueue.getTimedActionQueue=function() error("synthetic unreadable action queue") end
+    advance(60)
+    ISTimedActionQueue.getTimedActionQueue=original
+    assert(files["claude_percept.json"]:find('"qlen":-1',1,true),"unreadable queue was reported empty")
+end)
 local function stocked(x,y,items)
     local container={getItems=function() return vector(items) end}
     local object={getContainerCount=function() return 1 end,getContainerByIndex=function(_,index)

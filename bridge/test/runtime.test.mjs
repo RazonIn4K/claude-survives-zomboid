@@ -41,6 +41,18 @@ test('unresolved existing evidence prevents a gameplay model request',{timeout:4
   assert.equal(fs.existsSync(path.join(run.luaDir,'claude_intent.txt')),false);
 });
 
+test('busy or unreadable action state cannot start model work or claim verified cleanup',{timeout:7000,concurrency:true},async t=>{
+  await Promise.all([{qlen:-1},{qlen:null},{qlen:'0'},{nativeBusy:true},{nativeBusy:null}].map(extra=>t.test(JSON.stringify(extra),{concurrency:true},async t=>{
+    const run=temporaryRun(t);fakeGame(run,extra);
+    const endpoint=await model(run,(_req,res)=>reply(res));
+    const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_SECONDS:'1'});
+    const[code]=await processRun.exited;assert.equal(code,2);assert.equal(endpoint.calls.length,0);
+    const state=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
+    assert.equal(state.disarmObserved,false);assert.equal(state.lab.requests,0);
+    assert.equal(fs.existsSync(path.join(run.luaDir,'claude_intent.txt')),false);
+  })));
+});
+
 function temporaryRun(t) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'pz-runtime-'));
   const luaDir=path.join(root,'Lua');fs.mkdirSync(luaDir);
@@ -65,7 +77,7 @@ function temporaryRun(t) {
 function fakeGame(run,extras={}) {
   const file=path.join(run.luaDir,'claude_percept.json');
   const game={file,paused:false,offset:0,state:{labProtocol:1,session:'fixture-session',world:'fixture-world',actor:'0',
-    labToken:'',armed:false,dead:false,stopFailed:false,day:1,hour:9,hp:100,hunger:0.2,thirst:0.2,zClose:0,zNear:0,qlen:0,lastSeq:0,x:100,y:100,...extras}};
+    labToken:'',armed:false,dead:false,stopFailed:false,nativeBusy:false,day:1,hour:9,hp:100,hunger:0.2,thirst:0.2,zClose:0,zNear:0,qlen:0,lastSeq:0,x:100,y:100,...extras}};
   game.publish=()=>{
     if(game.paused)return;
     const now=Date.now()+game.offset;
@@ -288,6 +300,7 @@ test('dashboard exposes session limits and accepts only same-origin POST stop',{
   const payload='<img src=x onerror="stopAI()"> & \'quoted\'';
   await fetch(`${base}/god?text=${encodeURIComponent(payload)}`);
   const renderState=await(await fetch(`${base}/api/state`)).json();
+  renderState.percept.health={valid:false,summary:{bleedingParts:1,glassParts:0,unknownParts:2}};
   renderState.chat.push({from:'claude',text:payload,t:'<svg/onload=stopAI()>'});
   const elements=new Map();
   const document={getElementById(id){if(!elements.has(id))elements.set(id,{});return elements.get(id);}};
@@ -299,6 +312,7 @@ test('dashboard exposes session limits and accepts only same-origin POST stop',{
   assert.equal(rendered.includes('<img'),false);assert.equal(rendered.includes('<svg'),false);
   assert.ok(rendered.includes('&lt;img src=x onerror=&quot;stopAI()&quot;&gt; &amp; &#39;quoted&#39;'));
   assert.ok(rendered.includes('&lt;svg/onload=stopAI()&gt;'));
+  assert.match(elements.get('health').textContent,/Body check: incomplete.*known bleeding: 1.*unknown parts: 2/);
   assert.equal((await fetch(`${base}/control/stop`)).status,405);
   assert.equal((await fetch(`${base}/control/stop`,{method:'POST'})).status,403);
   assert.equal((await fetch(`${base}/control/stop`,{method:'POST',headers:{Origin:'https://untrusted.example'}})).status,403);
@@ -373,26 +387,27 @@ test('autonomous mode exits permanently after manual takeover during inference',
   assert.equal(control[1],'fixture-session');assert.equal(control[5],'DISARM');
 });
 
-test('continuous play passes three hundred requests and an hour, then dashboard stop prevents late output',{timeout:15000},async t=>{
+test('continuous play crosses former request and duration caps, then dashboard stop prevents late output',{timeout:15000},async t=>{
   const run=temporaryRun(t);
   const game=fakeGame(run);let held;
   const endpoint=await model(run,(_req,res,_request,count)=>{
-    if(count===305){held=res;return;}
+    if(count===5){held=res;return;}
     reply(res);
   });
-  // The child fixture starts its run clock an hour in the past without changing
-  // observation timestamps or lease time, and accelerates only the idle cadence.
-  // No production timing override or synchronization race is introduced.
+  // Put the counter immediately before the former request boundary and the run
+  // clock beyond an hour, then cross both with real bridge HTTP decisions. The
+  // pure LabRun suite separately exercises 400 sequential request increments.
+  // This avoids an unrelated high-rate HTTP load test in the runtime fixture.
   const fixture=`import {LabRun} from ${JSON.stringify(new URL('../lab.mjs',import.meta.url).href)};
     const bind=LabRun.prototype.bind;
-    LabRun.prototype.bind=function(...args){if(!this.fixtureElapsedHour){this.startedAt-=3601000;this.fixtureElapsedHour=true;}return bind.apply(this,args);};
+    LabRun.prototype.bind=function(...args){if(!this.fixtureElapsedHour){this.startedAt-=3601000;this.requests=300;this.fixtureElapsedHour=true;}return bind.apply(this,args);};
     const original=globalThis.setTimeout;globalThis.setTimeout=(fn,ms,...args)=>original(fn,ms===4000?5:ms,...args);`;
   const preload=`data:text/javascript,${encodeURIComponent(fixture)}`;
   const processRun=startBridge(run,{PZ_RUN_MODE:'continuous',PZ_MAX_REQUESTS:undefined,PZ_MAX_SECONDS:undefined,
     OLLAMA_URL:endpoint.url,PZ_TIMEOUT:'10000'},['--import',preload]);
   const base=await boot(processRun);await waitFor(()=>held,()=>processRun.output(),10000);
-  assert.equal(run.child.exitCode,null);assert.equal(endpoint.calls.length,305);
-  await waitFor(()=>game.state.lastSeq===304,()=>processRun.output());
+  assert.equal(run.child.exitCode,null);assert.equal(endpoint.calls.length,5);
+  await waitFor(()=>game.state.lastSeq===4,()=>processRun.output());
   const state=await(await fetch(`${base}/api/state`)).json();
   assert.equal(state.run.mode,'continuous');assert.equal(state.run.requests,305);
   assert.equal(state.run.maxRequests,null);assert.equal(state.run.remainingRequests,null);
@@ -407,10 +422,10 @@ test('continuous play passes three hundred requests and an hour, then dashboard 
   // Resolve the pending provider reply after the explicit stop: its new state
   // and command must not be accepted even though the continuous profile has no cap.
   reply(held,{action:{type:'MOVE',dx:2,dy:0},memory:'late reply must not be saved'});
-  const[code]=await processRun.exited;assert.equal(code,0);assert.equal(endpoint.calls.length,305);
+  const[code]=await processRun.exited;assert.equal(code,0);assert.equal(endpoint.calls.length,5);
   const saved=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
   assert.equal(saved.lab.mode,'continuous');assert.equal(saved.lab.reason,'dashboard_stop');
-  assert.equal(saved.lab.requests,305);assert.equal(saved.seq,304);assert.notEqual(saved.memory,'late reply must not be saved');
+  assert.equal(saved.lab.requests,305);assert.equal(saved.seq,4);assert.notEqual(saved.memory,'late reply must not be saved');
   assert.equal(saved.disarmObserved,true);assert.equal(saved.finalObservation.armed,false);
   assert.equal(fs.readFileSync(path.join(run.luaDir,'claude_intent.txt'),'utf8'),before);
   assert.ok(saved.log.length<=200,'continuous log retention grew beyond the cap');

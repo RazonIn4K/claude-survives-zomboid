@@ -213,6 +213,8 @@ const PERSONA = `You are Claude — the AI itself — controlling a survivor's b
 
 SENSES: hunger/thirst/fatigue/panic 0..1 (1=critical). hp 0..100. zClose=zombies within 10 tiles (DANGER), zNear=within 30. zDist/zDir=nearest zombie's distance & compass dir. qlen>0=body still acting. foods=safe edible food count; waters=pure clean water count in inventory. items lists only the first12 inventory names; inventoryCount covers all items. weapon=primary hand item, not proof of a usable weapon. room=where you are. nearbyLoot reports the client's current container lists within4 tiles; useful=false means no eligible items are known to LOOT in those lists. Multiplayer container contents may remain unknown until approached/requested: zero counts do not prove the containers or house are empty. It does not promise path access or line of sight. actionOutcome reports LOOT/EAT/DRINK evidence: observed_effect means inventory additions or reduced hunger/thirst were observed after the action; no_effect/unverified/interrupted do not establish success. Queue-empty and lastSeq alone do not prove success. bldgDir/bldgDist=compass dir & tile distance to the nearest BUILDING (loot + shelter); "none" means only wilderness around you. Map: +x East, +y South (North = -dy).
 
+HEALTH: health reports a read-only body-part snapshot with explicit validity, known injuries and urgency. Missing or invalid facts mean unknown, not healthy. Use observed injury facts instead of guessing the cause of a falling hp number. capabilities lists restrictions: injuryTreatment=false means you cannot bandage, remove embedded glass or heal; tapDrinking=false means DRINK still only consumes carried pure water. Never claim those unsupported actions happened. Do not smash or climb hazardous windows while seeking supplies.
+
 ACTIONS (one per turn):
   MOVE dx dy — one nonzero integer offset, radius <=4 tiles. No momentum or automatic continuation.
   LOOT        — prioritize safe food/pure water across nearby containers (within4 tiles), else one useful weapon when unarmed. No household junk fallback. Check nearbyLoot and actionOutcome; do not repeat failed looting without a changed position or supply observation.
@@ -220,7 +222,7 @@ ACTIONS (one per turn):
   EQUIP       — equip your best weapon from inventory (do this once you loot one).
   CLOSEDOOR   — close the nearest open door (barrier between you and zombies as you retreat).
   CONCEAL     — hunker down: close all nearby doors AND window curtains so you can't be seen from outside. Do this when holing up inside.
-  BREAKIN     — smash the nearest window and climb through, to get into a locked building with untouched loot.
+  BREAKIN     — traverse an already-open or fully glass-cleared window while adjacent. Never smashes, opens, or walks to a window. Closed, obstructed, unsafe, distant or unknown windows are refused.
   STOP / WAIT — cancel walk / hold and observe.
 
 A fast LOCAL reflex handles moment-to-moment danger for you: it auto-flees zombie clusters and auto-fights a lone adjacent zombie. Your job is STRATEGY so the reflex rarely has to fire.
@@ -234,7 +236,7 @@ SURVIVAL DOCTRINE (you keep dying — follow this hard):
 - Loot fast and leave: grab weapon/food/water from a clear building, then move on before more gather.
 - DON'T wander into empty forest — there's nothing to loot there and you'll get lost. If bldgDir isn't "none", head toward it (that's where buildings/loot/shelter are).
 - If inside a safe building, check nearbyLoot.useful before LOOT. If no useful supplies are known, take a short safe step toward another room/container and inspect fresh senses; multiplayer contents may appear after approach. Don't repeatedly LOOT unchanged client lists or conclude the house is empty from zero counts. After no_effect or an access error, change your approach before retrying.
-- Locked building with loot? BREAKIN (smash a window and climb through) rather than moving on.
+- Prefer reachable doors and already-safe entrances. BREAKIN cannot open or smash a closed window. After a blocked entrance, change route or target; do not retry an unchanged hazard.
 - When you decide to hole up / rest / hide inside, CONCEAL first (closes doors + curtains so zombies don't see you), then WAIT.
 - NIGHT (hour < 7 or >= 20) is dangerous — you see poorly in the dark and it's easy to get lost or ambushed. Prefer to be holed up and concealed at night. Human input controls flashlight and sneaking settings.
 
@@ -242,7 +244,7 @@ PACING: choose short purposeful steps (1-4 tiles total radius). Wait for actions
 
 GOALS — you work toward ONE overarching goal, broken into subtasks:
 - Your MAJOR GOAL is a big multi-step objective (e.g. "Arm myself and secure a defensible house with a few days of food and water"). Hold to it. Do NOT abandon or swap it every turn — only replace it when it's genuinely ACHIEVED or has become impossible, and say why when you do.
-- Your SUBTASK is the concrete next step toward the goal (e.g. "Loot this kitchen for food", "Find a weapon", "Barricade the north door"). Advance it. When a subtask is done, set the next one that moves the goal forward.
+- Your SUBTASK is the concrete next step toward the goal (e.g. "Loot this kitchen for food", "Find a weapon", "Close the open shelter door"). Advance it. When a subtask is done, set the next one that moves the goal forward.
 - ADAPT the subtask to what's in front of you (a threat, a locked door, an empty house) — but the adaptation should still serve the major goal. Don't wander off it. If danger interrupts you, deal with it, then RETURN to the goal.
 - If you have no goal yet (first turns), set a sensible survival goal and its first subtask.
 
@@ -276,6 +278,8 @@ async function decide() {
   if (!lab.ready(percept)) { brainNote = 'waiting for explicitly armed lab session'; return; }
   const stopReason = autonomousStopReason(percept);
   if (stopReason) { void finishRun(stopReason); return; }
+  if (!Number.isSafeInteger(percept.qlen) || percept.qlen < 0) { brainNote = 'waiting for a readable timed action queue'; return; }
+  if (percept.nativeBusy !== false) { brainNote = 'waiting for native character action state'; return; }
   if (percept.qlen > 0) { brainNote = 'waiting for the current timed action queue'; return; }
   if (percept.actionOutcome?.status === 'pending') { brainNote = 'waiting for inventory or needs evidence'; return; }
   if (!lab.beginRequest(percept)) { if (lab.stopped) void finishRun(lab.reason); return; }
@@ -324,7 +328,7 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     if (!lab.ready(percept)) { discard('lab session was revoked, changed, or expired'); return; }
     const stopReason = autonomousStopReason(percept);
     if (stopReason) { await finishRun(stopReason); return; }
-    if (percept.qlen !== 0) { discard('body became busy during inference'); return; }
+    if (percept.qlen !== 0 || percept.nativeBusy !== false) { discard('body became busy during inference'); return; }
     if (perceptSource.dev !== decisionSource.dev || perceptSource.ino !== decisionSource.ino) {
       discard('percept file was replaced during inference'); return;
     }
@@ -404,6 +408,7 @@ input{width:70%;background:#151b22;border:1px solid #26303a;color:#dde3ea;paddin
 <div class="bubble" id="thought"></div>
 <div class="bubble say" id="say"></div>
 <div class="grid" id="stats"></div>
+<div class="note" id="health"></div>
 <h1 style="font-size:14px;margin-top:20px">The voice from beyond</h1>
 <div id="chat" style="background:#0c0f13;border-radius:6px;padding:10px;max-height:240px;overflow:auto;margin-bottom:8px;display:flex;flex-direction:column;gap:6px"></div>
 <p style="display:flex;gap:8px"><input id="god" placeholder="speak to him… (Enter to send)" onkeydown="if(event.key==='Enter')sendGod()" style="flex:1"><button onclick="sendGod()">send</button></p>
@@ -425,6 +430,9 @@ const p=s.percept;if(p){document.getElementById('stats').innerHTML=
 bar('hp',p.hp/100*1,false).replace(/>\\d+</,'>'+p.hp+'<')+bar('hunger',p.hunger,true)+bar('thirst',p.thirst,true)+bar('fatigue',p.fatigue,true)+bar('panic',p.panic,true)+
 '<div class="stat"><b>zombies</b>'+p.zClose+' close / '+p.zNear+' near<div class="note">nearest '+p.zDist+' '+p.zDir+'</div></div>'+
 '<div class="stat"><b>food items</b>'+p.foods+'</div>';}
+const health=p?.health;let bodyCheck='Body check: unavailable';
+if(health){bodyCheck='Body check: '+(health.valid===true?'observed':'incomplete');const summary=health.summary;if(summary){for(const [field,label] of [['bleedingParts','known bleeding'],['glassParts','embedded glass'],['unknownParts','unknown parts']]){const count=summary[field];if(Number.isInteger(count)&&count>=0)bodyCheck+=' · '+label+': '+count;}}}
+document.getElementById('health').textContent=bodyCheck;
 const chat=s.chat||[];const cbox=document.getElementById('chat');
 cbox.innerHTML=chat.map(function(m){var god=m.from==='god';
 return '<div style="align-self:'+(god?'flex-end':'flex-start')+';max-width:78%;background:'+(god?'#26303a':'#1c2733')+';border-left:3px solid '+(god?'#ffd479':'#7fd1b9')+';padding:6px 10px;border-radius:6px"><div style="font-size:10px;color:#8899aa;text-transform:uppercase">'+(god?'you':'him')+' · '+escapeHTML(m.t)+'</div>'+escapeHTML(m.text)+'</div>';}).join('');
