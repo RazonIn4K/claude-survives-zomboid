@@ -79,6 +79,7 @@ export function loadBridgeConfig(env = process.env, {
   const luaDir = configuredPath(env, 'PZ_LUA_DIR', path.join(homeDir, 'Zomboid', 'Lua'), cwd);
   const perceptFile = path.join(luaDir, 'claude_percept.json');
   const intentFile = path.join(luaDir, 'claude_intent.txt');
+  const controlFile = path.join(luaDir, 'claude_control.txt');
   const stateFile = configuredPath(env, 'PZ_STATE_FILE', path.join(bridgeDir, 'pz-state.json'), cwd);
 
   // The default Lua directory may be absent before the game's first launch. An explicit
@@ -87,7 +88,7 @@ export function loadBridgeConfig(env = process.env, {
   checkPath('PZ_STATE_FILE parent directory', path.dirname(stateFile), 'directory');
   checkPath('PZ_STATE_FILE', stateFile, 'file', true);
   const stateIdentity = fileIdentity(stateFile);
-  if ([perceptFile, intentFile, `${intentFile}.tmp`]
+  if ([perceptFile, intentFile, `${intentFile}.tmp`, controlFile, `${controlFile}.tmp`]
     .some(file => aliases(stateIdentity, fileIdentity(file)))) {
     throw new Error('PZ_STATE_FILE must be separate from the percept and intent files.');
   }
@@ -98,6 +99,7 @@ export function loadBridgeConfig(env = process.env, {
     luaDir,
     perceptFile,
     intentFile,
+    controlFile,
     stateFile,
   });
 }

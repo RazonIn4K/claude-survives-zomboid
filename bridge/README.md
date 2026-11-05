@@ -1,5 +1,62 @@
 # The bridge (the brain)
 
+## Safe-default laboratory fork
+
+This fork starts **monitor-only**. It makes no model requests and does not arm
+Lua unless `PZ_LAB_ARM=1` is explicitly set. The matching Lua starts disarmed;
+legacy intent lines and unmodified upstream percepts cannot control it.
+
+An explicitly armed run is limited to `PZ_MAX_REQUESTS` provider attempts (1–10,
+default 10) and `PZ_MAX_SECONDS` seconds (1–300, default 120), counted from bridge
+startup even if the game never supplies a percept. Failed HTTP calls, invalid
+JSON and discarded replies consume attempts. There is no automatic retry.
+
+Example using an already running loopback OpenAI-compatible model gateway:
+
+```sh
+PZ_LAB_ARM=1 PZ_MAX_REQUESTS=5 PZ_MAX_SECONDS=120 \
+PZ_BACKEND=openai PZ_API_KEYLESS=1 PZ_MODEL=gpt-6.1-sol PZ_REASONING_EFFORT=none \
+OPENAI_BASE_URL=http://127.0.0.1:4141/v1 \
+PZ_LUA_DIR=/absolute/path/to/task-client/Lua \
+PZ_STATE_FILE=/absolute/path/to/existing/run-directory/memory.json \
+node pz-bridge.mjs
+```
+
+Keyless mode is accepted only for an explicit HTTP loopback endpoint and sends
+no Authorization header. Cloud providers use their separately configured key.
+The bridge reads environment variables; it does not load `.env` files itself.
+
+The bridge binds one world, actor and session, then renews a two-second lease in
+`claude_control.txt`. Every intent carries that identity, a controller token and
+an expiry. Lua checks them before executing any action. MOVE offsets have a
+four-tile radius, loot searches are restricted to four tiles, travel momentum
+is disabled, and this fork never changes game speed or automatic sneak/light
+settings. Initial ARM refuses a pre-existing timed-action queue; lease renewal
+can continue while the controller's own actions are queued. Existing local reflex,
+loot, eating, drinking, equipment and concealment functions run only while the
+lease is armed. Runtime success of those engine calls still needs a playtest.
+
+**Any key or mouse input permanently disarms and rotates the session.** Idle
+input never automatically resumes the AI. Exit the stopped bridge and explicitly
+start another opted-in run to arm the new session. A missing heartbeat, pause/tick
+gap, player change, world change, death or duration cap also revokes control.
+Use Ctrl-C to request bridge shutdown. On finish, it stops heartbeat publication,
+writes DISARM, and waits up to 3.5 seconds for a fresh unarmed percept from the
+same world and actor, an empty queue, and no reported queue-clear failure. The final
+state includes `lab.requests`, `lab.reason`, `finalObservation` and
+`disarmObserved`; a written stop command alone is not proof of disarming. An
+unobserved cleanup exits with status 2. The lease limits game-control duration;
+shutdown may use the extra observation window to record that control ended.
+
+The final intent gets at most ten seconds, within the overall lifetime, to be
+consumed and finish its timed-action queue. A consumed sequence and empty queue
+are **not success receipts**. Compare actual position, inventory/vitals and
+object state to establish an effect. This remains a player-client prototype,
+not a server-owned NPC system or proven multiplayer survival bot. Do not enable
+a second controller for the same player simultaneously.
+
+## Backend and dashboard
+
 `pz-bridge.mjs` reads the game's perception, asks an LLM what to do, writes the decision back, and serves the live mind dashboard at `http://127.0.0.1:8799/mind`. The HTTP listener binds explicitly to IPv4 loopback (`127.0.0.1`). `llm.mjs` is the pluggable backend.
 
 ```bash
@@ -46,6 +103,8 @@ On Windows PowerShell, set vars with `$env:NAME="value"` before `node pz-bridge.
 | Var | Default | What |
 |-----|---------|------|
 | `PZ_MODEL` | per-backend | The model to use. |
+| `PZ_API_KEYLESS` | unset | Only `1` enables explicit loopback access without sending an Authorization header. |
+| `PZ_REASONING_EFFORT` | unset | Optional setting for a model that supports it; the lab example uses `none`. |
 | `PZ_TIMEOUT` | `45000` | Per-decision timeout (ms). Bump it for slow local models. |
 | `PZ_PORT` | `8799` | Dashboard + intent port on `127.0.0.1`. Integer `0`–`65535`; `0` asks the OS for an available port, printed on startup. |
 | `PZ_LUA_DIR` | `~/Zomboid/Lua` | Directory containing `claude_percept.json` and `claude_intent.txt`. Explicit overrides must already exist. |
@@ -67,21 +126,17 @@ Separation checks resolve directory/file symlinks and detect existing hardlinks.
 
 The bridge uses the percept file's modification time, not the time Node reads
 it, for its 15-second freshness limit. It checks current readable JSON before
-starting a decision and again immediately after the model returns, including a
+starting a decision and again immediately after the model returns, with no automatic
 retry. A reply is discarded before changing the intent, sequence, goals, reply,
 or memory if its original senses have expired, the current percept is unreadable
-or stale, the survivor is dead, or the percept file was replaced. Unanswered
+or stale, the survivor is dead, the body became busy, or the percept file was replaced. Unanswered
 dashboard guidance is retained for the next accepted decision. Raising
 `PZ_TIMEOUT` does not extend this freshness limit; a model that regularly takes
 longer than 15 seconds will have its decisions discarded.
 
-This guard is not a game-session or human-takeover protocol. The shipped Lua
-percept does not identify the world/character/session or report manual mode.
-An in-place file rewrite can therefore represent a different survivor without
-being recognized as one. A previously published intent also remains available
-for Lua to consume, and accepted movement can continue through Lua's momentum
-logic. Do not treat this change as safe multiplayer NPC control or a guarantee
-against commands resuming after manual takeover.
+The lab protocol additionally binds world, actor and session and revokes control
+on takeover. This does not add multiplayer NPC ownership or action-success
+receipts; those remain separate integration and playtest requirements.
 
 ## Isolated development runs
 
@@ -100,4 +155,4 @@ This only changes the bridge's paths. To connect a real game instance, its mod m
 
 ## Local tests
 
-Run `npm test` from `bridge/`. No package installation is needed. Tests use Node's built-in runner, temporary directories, synthetic game data, and a fake Ollama endpoint on an OS-assigned loopback port. They do not launch the game or a provider CLI, inherit API keys, or contact a real model service. The runtime smoke test takes about ten seconds because it preserves the bridge's normal decision cadence.
+Run `npm test` from `bridge/`. No package installation is needed. Tests use Node's built-in runner, temporary directories, synthetic game data, and a fake Ollama endpoint on an OS-assigned loopback port. If `lua` is installed, they also run deterministic gate and whole-body engine-stub checks; otherwise that entry is explicitly skipped. They do not launch the game or a provider CLI, inherit API keys, or contact a real model service. The runtime smoke test takes about ten seconds because it preserves the bridge's normal decision cadence.

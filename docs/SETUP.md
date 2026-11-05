@@ -1,3 +1,10 @@
+> **Current fork:** Lua starts disarmed, all keyboard/mouse input permanently
+> revokes its session, and the bridge requires `PZ_LAB_ARM=1` with a finite
+> request/time budget. The bridge and Lua must both be updated together.
+> [Current lab startup and stop instructions](../bridge/README.md) supersede
+> the older upstream walkthrough below. Multiplayer compatibility and survival
+> engine actions still need actual playtesting.
+
 # Setup & troubleshooting
 
 Claude Survives has two halves that talk through your Zomboid folder:
@@ -5,7 +12,7 @@ Claude Survives has two halves that talk through your Zomboid folder:
 - **The mod** (`mods/ClaudeSurvivor`) — runs *inside* Project Zomboid, reads the game, drives the body.
 - **The bridge** (`bridge/pz-bridge.mjs`) — a Node script that reads the mod's perception, asks Claude what to do, and writes back the decision. It also serves the live dashboard.
 
-Both must be running. The mod alone does nothing.
+Both must be running and explicitly armed; without a fresh bridge lease, the mod stays disarmed.
 
 ## Requirements
 
@@ -32,7 +39,7 @@ It copies the mod into `%USERPROFILE%\Zomboid\mods\ClaudeSurvivor`.
 
 ```bash
 cd bridge
-node pz-bridge.mjs
+PZ_LAB_ARM=1 PZ_MAX_REQUESTS=5 PZ_MAX_SECONDS=120 node pz-bridge.mjs
 ```
 You should see:
 ```
@@ -52,8 +59,8 @@ Leave it running.
 | Key | Action |
 |-----|--------|
 | **H** | Toggle the in-game HUD |
-| **G** | Toggle AI auto game-speed |
-| move keys | Take manual control; AI resumes ~10s after you stop moving |
+| **G** | Any key disarms; game speed is unchanged |
+| any keyboard or mouse input | Permanently disarm the current session |
 
 ## Troubleshooting
 

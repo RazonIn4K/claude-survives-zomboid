@@ -42,8 +42,9 @@ async function fetchJSON(url, opts, label) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), TIMEOUT);
   try {
-    const r = await fetch(url, { ...opts, signal: ctl.signal });
-    if (!r.ok) throw new Error(`${label} ${r.status}: ${(await r.text()).slice(0, 300)}`);
+    const r = await fetch(url, { ...opts, signal: ctl.signal, redirect: 'error' });
+    // Provider error bodies may contain account data or echo request content.
+    if (!r.ok) throw new Error(`${label} HTTP ${r.status}`);
     return await r.json();
   } finally { clearTimeout(t); }
 }
@@ -59,10 +60,29 @@ async function callAnthropic(prompt) {
 
 async function callOpenAI(prompt) {
   const base = env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
-  const j = await fetchJSON(base + '/chat/completions', {
+  const url = new URL(base);
+  const keyless = env.PZ_API_KEYLESS === '1';
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error('OpenAI-compatible base URL must not contain credentials, query, or fragment');
+  }
+  if (keyless && !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) {
+    throw new Error('Keyless model access is restricted to loopback');
+  }
+  if (url.protocol === 'http:' && !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) {
+    throw new Error('Remote model endpoints require HTTPS');
+  }
+  if (!keyless && !env.OPENAI_API_KEY?.trim()) throw new Error('OPENAI_API_KEY is not configured');
+  const body = { model: MODEL, max_completion_tokens: 500, messages: [{ role: 'user', content: prompt }] };
+  if (env.PZ_REASONING_EFFORT) {
+    if (!['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(env.PZ_REASONING_EFFORT)) {
+      throw new Error('Invalid PZ_REASONING_EFFORT');
+    }
+    body.reasoning_effort = env.PZ_REASONING_EFFORT;
+  }
+  const j = await fetchJSON(base.replace(/\/$/, '') + '/chat/completions', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + env.OPENAI_API_KEY },
-    body: JSON.stringify({ model: MODEL, max_tokens: 500, messages: [{ role: 'user', content: prompt }] }),
+    headers: { 'content-type': 'application/json', ...(keyless ? {} : { authorization: 'Bearer ' + env.OPENAI_API_KEY }) },
+    body: JSON.stringify(body),
   }, 'openai');
   return j.choices?.[0]?.message?.content || '';
 }

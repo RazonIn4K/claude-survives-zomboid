@@ -39,6 +39,7 @@ test('defaults preserve the original paths without creating a game directory', t
     luaDir: path.join(options.homeDir, 'Zomboid', 'Lua'),
     perceptFile: path.join(options.homeDir, 'Zomboid', 'Lua', 'claude_percept.json'),
     intentFile: path.join(options.homeDir, 'Zomboid', 'Lua', 'claude_intent.txt'),
+    controlFile: path.join(options.homeDir, 'Zomboid', 'Lua', 'claude_control.txt'),
     stateFile: path.join(options.bridgeDir, 'pz-state.json'),
   });
   assert.equal(fs.existsSync(config.luaDir), false);
@@ -100,7 +101,7 @@ test('state requires an existing parent directory and cannot itself be a directo
 
 test('state cannot overwrite percept, intent or the atomic intent temporary file', t => {
   const { options } = fixture(t);
-  for (const name of ['claude_percept.json', 'claude_intent.txt', 'claude_intent.txt.tmp']) {
+  for (const name of ['claude_percept.json', 'claude_intent.txt', 'claude_intent.txt.tmp', 'claude_control.txt', 'claude_control.txt.tmp']) {
     assert.throws(() => loadBridgeConfig({
       PZ_LUA_DIR: options.cwd,
       PZ_STATE_FILE: path.join(options.cwd, name),
@@ -112,7 +113,7 @@ test('state cannot share an IPC path through an aliased directory before the fil
   const { root, options } = fixture(t);
   const alias = path.join(root, 'linked-lua');
   if (!createLink(t, () => fs.symlinkSync(options.cwd, alias, 'dir'))) return;
-  for (const name of ['claude_percept.json', 'claude_intent.txt', 'claude_intent.txt.tmp']) {
+  for (const name of ['claude_percept.json', 'claude_intent.txt', 'claude_intent.txt.tmp', 'claude_control.txt', 'claude_control.txt.tmp']) {
     const target = path.join(options.cwd, name);
     assert.throws(() => loadBridgeConfig({ PZ_LUA_DIR: alias, PZ_STATE_FILE: target }, options),
       /PZ_STATE_FILE must be separate/);
@@ -122,7 +123,7 @@ test('state cannot share an IPC path through an aliased directory before the fil
 
 test('state cannot alias an existing IPC file through a file symlink', t => {
   const { root, options } = fixture(t);
-  for (const name of ['claude_percept.json', 'claude_intent.txt', 'claude_intent.txt.tmp']) {
+  for (const name of ['claude_percept.json', 'claude_intent.txt', 'claude_intent.txt.tmp', 'claude_control.txt', 'claude_control.txt.tmp']) {
     const target = path.join(options.cwd, name);
     const alias = path.join(root, `${name}.memory-link`);
     fs.writeFileSync(target, 'synthetic IPC data');
@@ -135,7 +136,7 @@ test('state cannot alias an existing IPC file through a file symlink', t => {
 
 test('state cannot alias an existing IPC file through a hardlink', t => {
   const { root, options } = fixture(t);
-  for (const name of ['claude_percept.json', 'claude_intent.txt', 'claude_intent.txt.tmp']) {
+  for (const name of ['claude_percept.json', 'claude_intent.txt', 'claude_intent.txt.tmp', 'claude_control.txt', 'claude_control.txt.tmp']) {
     const target = path.join(options.cwd, name);
     const alias = path.join(root, `${name}.memory-link`);
     fs.writeFileSync(target, 'synthetic IPC data');
@@ -158,7 +159,7 @@ test('dangling state symlinks are rejected without creating their targets', t =>
 
 test('IPC names are reserved without regard to case within the same resolved directory', t => {
   const { options } = fixture(t);
-  for (const name of ['CLAUDE_PERCEPT.JSON', 'CLAUDE_INTENT.TXT', 'CLAUDE_INTENT.TXT.TMP']) {
+  for (const name of ['CLAUDE_PERCEPT.JSON', 'CLAUDE_INTENT.TXT', 'CLAUDE_INTENT.TXT.TMP', 'CLAUDE_CONTROL.TXT', 'CLAUDE_CONTROL.TXT.TMP']) {
     assert.throws(() => loadBridgeConfig({
       PZ_LUA_DIR: options.cwd, PZ_STATE_FILE: path.join(options.cwd, name),
     }, options), /PZ_STATE_FILE must be separate/);

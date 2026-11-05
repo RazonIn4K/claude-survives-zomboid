@@ -2,9 +2,8 @@
 -- Perception OUT : one-line JSON to  %USERPROFILE%/Zomboid/Lua/claude_percept.json  (~1/s)
 -- Intent     IN  : reads  %USERPROFILE%/Zomboid/Lua/claude_intent.txt  ->  "SEQ|ACTION|A|B|SAY|THOUGHT"
 --                  Actions: MOVE dx dy | EAT | DRINK | LOOT | EQUIP | STOP | WAIT
--- Fluidity       : moves walk to the FARTHEST LOADED square along the heading (long, smooth
---                  paths) and "momentum" keeps the body drifting in that heading between
---                  decisions, so it never freezes waiting on the brain.
+-- Lab movement   : integer offsets within four tiles; no momentum or game-speed changes.
+-- Lab control    : initially disarmed; a fresh world/actor/session heartbeat gates all autonomy.
 -- Reflex         : a zombie inside 6 tiles while idle -> auto-flee instantly (no round-trip).
 -- HUD            : on-screen overlay (toggle with H) showing action, live thought, vitals,
 --                  inventory and zombie awareness — full visual transparency.
@@ -18,26 +17,47 @@ local REFLEX_COOLDOWN = 300
 local tick       = 0
 local lastSeq    = 0
 local lastError  = ""
+local lastIntentRaw = nil
 local announced  = false
 local reflexTick = -99999
 local lastLootTick = -99999   -- protects an in-progress loot from being interrupted
 local travel     = { active = false, dx = 0, dy = 0, budget = 0 }  -- momentum
 
--- human override: you can grab the keyboard to help; the AI stands down and auto-resumes
--- once you've stopped (no input AND the body stood still) for MANUAL_IDLE ticks (~10s).
-local MANUAL_IDLE = 600
-local manualMode  = false
-local lastHumanKeyTick = -99999
-local lastMoveTick = 0
-local lastPX, lastPY = nil, nil
+-- Human takeover is permanent for the current session; the lab gate below owns it.
 local observing = false   -- true while the AI is deliberately holding to look around
 
--- panic pause: in a truly dire moment, briefly PAUSE the game so the brain (and you) can catch
--- up. Used sparingly — long cooldown, only genuine emergencies. Any key press cancels it.
-local panicUntilTick   = -1
-local lastPanicTick     = -99999
-local PANIC_COOLDOWN    = 1800   -- ~30s between panics
-local PANIC_LEN         = 180    -- ~3s paused
+-- Safe-default player-client lab lease. No Lua autonomy runs before explicit arming.
+require "ClaudeLabControl"
+local lab = ClaudeLabControl.new({
+  now = function() return tonumber(getTimestampMs()) end,
+  random = function() return ZombRand(1000000) end,
+  identity = function(p) return tostring(getWorld():getWorld()), tostring(p:getOnlineID()) end,
+  readControl = function()
+    local ok, line = pcall(function()
+      local reader = getFileReader("claude_control.txt", false)
+      if not reader then return nil end
+      local value = reader:readLine(); reader:close(); return value
+    end)
+    return ok and line or nil
+  end,
+  busy = function(p)
+    local ok, busy = pcall(function()
+      local q = ISTimedActionQueue.getTimedActionQueue(p)
+      return q and q.queue and #q.queue > 0 or false
+    end)
+    return not ok or busy
+  end,
+  stop = function(p)
+    travel.active, travel.budget, observing = false, 0, false
+    if not p then return false end
+    local ok, empty = pcall(function()
+      ISTimedActionQueue.clear(p)
+      local q = ISTimedActionQueue.getTimedActionQueue(p)
+      return q and q.queue and #q.queue == 0 or false
+    end)
+    return ok and empty
+  end,
+})
 
 -- shared with the HUD (below)
 local HUD = {
@@ -181,6 +201,12 @@ local function buildPercept(p)
 
   local j = '{'
   j = j .. '"dead":' .. tostring(p:isDead())
+  j = j .. ',"labProtocol":1,"armed":' .. tostring(lab.armed)
+  j = j .. ',"session":"' .. esc(lab.session or "") .. '","world":"' .. esc(lab.world or "") .. '"'
+  j = j .. ',"actor":"' .. esc(lab.actor or "") .. '","labToken":"' .. esc(lab.token or "") .. '"'
+  j = j .. ',"observed_ms":' .. string.format("%.0f", tonumber(getTimestampMs()))
+  j = j .. ',"controlReason":"' .. esc(lab.reason) .. '","lease_until_ms":' .. string.format("%.0f", lab.leaseUntil)
+  j = j .. ',"stopFailed":' .. tostring(lab.stopFailed)
   j = j .. ',"x":' .. math.floor(px) .. ',"y":' .. math.floor(py) .. ',"z":' .. math.floor(pz)
   j = j .. ',"hour":' .. hour .. ',"day":' .. day
   j = j .. ',"outside":' .. tostring(p:isOutside())
@@ -215,8 +241,10 @@ end
 -- halving down to a tiny hop we step the vector down until a square exists — longest smooth path.
 local function stepWalk(p, dx, dy)
   local px, py, pz = math.floor(p:getX()), math.floor(p:getY()), math.floor(p:getZ())
-  dx = math.max(-40, math.min(40, math.floor(tonumber(dx) or 0)))
-  dy = math.max(-40, math.min(40, math.floor(tonumber(dy) or 0)))
+  if not lab.armed then return false end
+  dx, dy = math.floor(tonumber(dx) or 0), math.floor(tonumber(dy) or 0)
+  local length = math.sqrt(dx*dx + dy*dy)
+  if length > 4 then dx, dy = math.floor(dx/length*3 + 0.5), math.floor(dy/length*3 + 0.5) end
   if dx == 0 and dy == 0 then return false end
   for i = 8, 1, -1 do
     local tx = px + math.floor(dx * i / 8 + 0.5)
@@ -229,35 +257,13 @@ local function stepWalk(p, dx, dy)
 end
 
 local function doMove(p, dx, dy)
-  dx = math.max(-40, math.min(40, math.floor(tonumber(dx) or 0)))
-  dy = math.max(-40, math.min(40, math.floor(tonumber(dy) or 0)))
-  -- if already walking the SAME general direction, just refresh the heading — don't clear and
-  -- restart the path (that's what caused the bumping/stutter). Only re-path on a real change.
-  local qlen = 0
-  pcall(function() local q = ISTimedActionQueue.getTimedActionQueue(p); if q and q.queue then qlen = #q.queue end end)
-  if qlen > 0 and travel.active and (dx * travel.dx + dy * travel.dy) > 0 then
-    travel.dx, travel.dy, travel.budget = dx, dy, 6
-    return
-  end
+  if not lab.armed then return end
   ISTimedActionQueue.clear(p)
-  travel.active, travel.dx, travel.dy, travel.budget = true, dx, dy, 6
+  travel.active, travel.budget = false, 0
   stepWalk(p, dx, dy)
 end
 
--- momentum: while traveling, if the body finished its segment and the brain hasn't redirected
--- (and nothing's close), keep drifting in the same heading so motion stays continuous.
-local function momentum(p)
-  if not travel.active or travel.budget <= 0 then return end
-  local _, _, zClose = zombieScan(p:getX(), p:getY())
-  if zClose > 0 then return end
-  local qlen = 0
-  pcall(function() local q = ISTimedActionQueue.getTimedActionQueue(p); if q and q.queue then qlen = #q.queue end end)
-  if qlen > 0 then return end
-  local len = math.sqrt(travel.dx * travel.dx + travel.dy * travel.dy)
-  if len < 1 then travel.active = false; return end
-  travel.budget = travel.budget - 1
-  stepWalk(p, math.floor(travel.dx / len * 8 + 0.5), math.floor(travel.dy / len * 8 + 0.5))
-end
+-- No momentum: a completed walk remains stopped until a new validated decision.
 
 -- ---------- other actions ----------
 local function doEat(p)
@@ -297,7 +303,7 @@ local function doLoot(p)
               local n = 0; pcall(function() n = c:getItems():size() end)
               if n > 0 then
                 local d = math.abs(dx) + math.abs(dy)
-                if d < bestD then bestD, best, bestSq = d, c, sq end
+                if d <= 4 and d < bestD then bestD, best, bestSq = d, c, sq end
               end
             end
           end
@@ -305,7 +311,7 @@ local function doLoot(p)
       end
     end
   end
-  if not best then lastError = "loot: no stocked container within 10 tiles"; return end
+  if not best then lastError = "loot: no stocked container within 4 tiles"; return end
   lastLootTick = tick                       -- protect this loot from interruption (see MOVE handler)
   ISTimedActionQueue.clear(p)
   if not pcall(function() luautils.walkAdj(p, bestSq) end) then ISTimedActionQueue.add(ISWalkToTimedAction:new(p, bestSq)) end
@@ -430,11 +436,12 @@ local function manageLight(p)
 end
 
 local function execIntent(p, line)
-  local parts = split(line, "|")
+  if line == lastIntentRaw then return end -- consumed duplicate: preserve the actual action diagnostic
+  local parts, rejection = lab:accept(line)
+  if not parts then lastError = "intent:" .. tostring(rejection); return end
   local seq = tonumber(parts[1])
-  if not seq or seq <= lastSeq then return end
-  lastSeq = seq
-  lastError = ""
+  lastIntentRaw = line
+  lastSeq, lastError = seq, ""
   local action = parts[2] or "WAIT"
   local a, b = parts[3], parts[4]
   local say = parts[5] or ""
@@ -597,47 +604,24 @@ end
 
 -- auto game-speed: fast-forward the boring safe stretches, snap to normal near danger so the
 -- reflex keeps full fidelity. Toggle with G. The user's manual pause (speed 0) always wins.
-local autoSpeed = true
-local function manageSpeed(p)
-  if not autoSpeed then return end
-  local ok, cur = pcall(function() return getGameSpeed() end)
-  if not ok or cur == 0 then return end          -- paused by user -> leave it
-  local _, nd = nearestZombie(p:getX(), p:getY(), 70)
-  local want = 1
-  if not manualMode and nd > 45 then want = 2 end  -- safe & clear -> gentle fast-forward
-  if cur ~= want then pcall(function() setGameSpeed(want) end) end
-end
+local autoSpeed = false -- lab control never changes game speed
 
 -- ---------- main loop ----------
 local function onTick()
   tick = tick + 1
   local p = getSpecificPlayer(0)
+  local active = lab:update(p)
   if not p then return end
-  if not announced then announced = true; pcall(function() p:Say("Claude online. Let's survive this.") end) end
-  if p:isDead() then
-    HUD.action = "DEAD"
-    if tick % (PERCEPT_EVERY * 5) == 0 then writePercept(p) end
+  lastSeq = lab.lastSeq
+  if lab.changed or tick % PERCEPT_EVERY == 0 then
+    writePercept(p); lab.changed = false
+  end
+  if not active then
+    HUD.action = p:isDead() and "DEAD" or ("DISARMED — " .. lab.reason)
     return
   end
-
-  -- track movement for the manual auto-resume
+  if not announced then announced = true; pcall(function() p:Say("Claude lab armed. Testing survival actions.") end) end
   local px, py = p:getX(), p:getY()
-  if lastPX and (math.abs(px - lastPX) + math.abs(py - lastPY) > 0.3) then lastMoveTick = tick end
-  lastPX, lastPY = px, py
-
-  if manualMode then
-    local qlen = 0
-    pcall(function() local q = ISTimedActionQueue.getTimedActionQueue(p); if q and q.queue then qlen = #q.queue end end)
-    if (tick - lastMoveTick) > MANUAL_IDLE and (tick - lastHumanKeyTick) > MANUAL_IDLE and qlen == 0 then
-      manualMode = false
-      travel.active = false
-      pcall(function() p:Say("I've got it from here.") end)
-    else
-      HUD.action = "MANUAL — you're driving"
-      if tick % PERCEPT_EVERY == 0 then writePercept(p) end
-      return
-    end
-  end
 
   -- SURVIVAL first, every ~5 ticks (fight/flee locally — the brain is too slow for this).
   -- NOTE: no auto game-pause — PZ halts OnTick at speed 0 so the mod could never un-pause itself
@@ -645,20 +629,8 @@ local function onTick()
   local acted = false
   if tick % 5 == 0 then pcall(function() acted = survive(p) end) end
 
-  -- CROUCH/SNEAK to avoid drawing zombies when they're around but we're not mid-flee; stand tall
-  -- (no sneak) while actively escaping so we move at full speed.
-  if tick % 30 == 0 then
-    local _, nd = nearestZombie(px, py, 30)
-    -- sneak only at MID range (creep past); never in melee (would cripple attacks) or mid-flee
-    local sneak = nd >= 6 and nd < 25 and (tick - reflexTick > 90)
-    pcall(function() p:setSneaking(sneak) end)
-  end
-
-  if tick % 15 == 0 then pcall(function() manageSpeed(p) end) end
-  if tick % 90 == 0 then pcall(function() manageLight(p) end) end
+  -- Lab mode leaves persistent sneak/light settings under human control.
   if tick % 120 == 0 then pcall(function() scanBuildings(math.floor(px), math.floor(py), math.floor(p:getZ())) end) end
-  -- keep the body moving between decisions so he's never frozen without a reason
-  if not acted and tick % 20 == 0 then pcall(function() momentum(p) end) end
 
   -- VISIBLE "look around" while deliberately observing: turn through the compass every ~0.5s
   -- so a pause reads clearly as scanning, not a freeze. Exaggerated on purpose.
@@ -758,23 +730,11 @@ local function startHUD()
 end
 Events.OnGameStart.Add(startHUD)
 Events.OnCreatePlayer.Add(function() startHUD() end)
--- human override: pressing a movement/action key hands control to you; the AI stands down
--- and auto-resumes once you've stopped moving for ~10s (see onTick).
-local MOVE_KEYS = {
-  [Keyboard.KEY_W] = true, [Keyboard.KEY_A] = true, [Keyboard.KEY_S] = true, [Keyboard.KEY_D] = true,
-  [Keyboard.KEY_UP] = true, [Keyboard.KEY_DOWN] = true, [Keyboard.KEY_LEFT] = true, [Keyboard.KEY_RIGHT] = true,
-  [Keyboard.KEY_E] = true, [Keyboard.KEY_SPACE] = true, [Keyboard.KEY_F] = true, [Keyboard.KEY_R] = true, [Keyboard.KEY_Q] = true,
-}
+-- Any keyboard or mouse input permanently revokes this lab session. Restart an
+-- explicitly opted-in bridge to arm the new session; idle time never resumes it.
 Events.OnKeyPressed.Add(function(key)
-  if key == Keyboard.KEY_H then HUD.visible = not HUD.visible; return end
-  if key == Keyboard.KEY_G then autoSpeed = not autoSpeed; if not autoSpeed then pcall(function() setGameSpeed(1) end) end; return end
-  if MOVE_KEYS[key] then
-    lastHumanKeyTick = tick
-    if panicUntilTick > 0 then panicUntilTick = -1; pcall(function() setGameSpeed(1) end) end  -- you took over -> unpause
-    if not manualMode then
-      manualMode = true
-      travel.active = false
-      pcall(function() ISTimedActionQueue.clear(getSpecificPlayer(0)) end)
-    end
-  end
+  lab:manual()
+  if key == Keyboard.KEY_H then HUD.visible = not HUD.visible end
 end)
+Events.OnMouseDown.Add(function() lab:manual() end)
+if Events.OnRightMouseDown then Events.OnRightMouseDown.Add(function() lab:manual() end) end

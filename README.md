@@ -1,3 +1,12 @@
+> **Laboratory fork update:** the installed Lua now starts disarmed. The bridge
+> defaults to observation only; explicitly set `PZ_LAB_ARM=1` to start a bounded
+> run (at most ten provider attempts and 300 seconds). Any key or mouse input
+> permanently revokes that session; there is no idle auto-resume. Movement
+> momentum and automatic game-speed changes are disabled. Read
+> [the current lab protocol and startup instructions](bridge/README.md) before
+> using the older upstream feature descriptions below. Survival engine actions
+> have not yet been verified in our B42.21 multiplayer laboratory.
+
 <div align="center">
 
 # 🧟 Claude Survives
@@ -31,8 +40,8 @@ It is **not** a bot with hard-coded routines. The strategy is genuinely reasoned
 - ⚡ **Local survival reflex** — sub-second fight-or-flee that keeps the body alive between the AI's slower thoughts: repulsion-vector evasion, melee against lone attackers, door-closing.
 - 👁️ **Full visual transparency** — an in-game HUD shows the AI's current action, live inner monologue, vitals, zombie proximity, and inventory. It speaks its decisions aloud in speech bubbles and visibly scans its surroundings.
 - 🗺️ **Situational awareness** — senses nearby buildings (so it heads for loot, not into the endless forest), tracks threats with its gaze, and knows the time of day.
-- 🎮 **You can jump in** — grab the keyboard any time to help; the AI stands down and auto-resumes 10 seconds after you stop.
-- ⏩ **Smart game-speed** — auto fast-forwards the boring safe stretches and snaps back to normal near danger.
+- 🎮 **You can jump in** — press a key or click to permanently disarm the current lab session.
+- ⏩ **Smart game-speed** — disabled in this fork to preserve multiplayer game speed.
 - 🌐 **Web dashboard** — watch its mind at `localhost:8799/mind`, and text it like a voice from beyond.
 
 ## How it works (30 seconds)
@@ -62,7 +71,7 @@ The game and the brain talk through two small files in your Zomboid folder. The 
 2. **Start the brain:**
    ```bash
    cd bridge
-   node pz-bridge.mjs
+   PZ_LAB_ARM=1 PZ_MAX_REQUESTS=5 PZ_MAX_SECONDS=120 node pz-bridge.mjs
    ```
    It prints `pz-bridge up on http://localhost:8799/mind`.
 
@@ -77,8 +86,8 @@ See [docs/SETUP.md](docs/SETUP.md) for the detailed walkthrough and troubleshoot
 | Key | Action |
 |-----|--------|
 | **H** | Toggle the in-game HUD |
-| **G** | Toggle AI auto game-speed |
-| **W/A/S/D** (or move) | Take manual control; AI resumes ~10s after you stop |
+| **G** | No speed changes; any key disarms the lab session |
+| **Any key or mouse input** | Permanently disarm; start a new explicit bridge run to rearm |
 
 ## Architecture
 

@@ -11,25 +11,28 @@ import http from 'node:http';
 import fs from 'node:fs';
 import { callLLM, BACKEND, MODEL } from './llm.mjs';
 import { loadBridgeConfig } from './config.mjs';
+import { LabRun, labConfig } from './lab.mjs';
 
-let config;
+let config, runConfig;
 try {
   config = loadBridgeConfig();
+  runConfig = labConfig();
 } catch (error) {
   console.error(`pz-bridge configuration error: ${error.message}`);
   process.exit(1);
 }
 const { host: HOST, port: PORT, perceptFile: PERCEPT_FILE,
-  intentFile: INTENT_FILE, stateFile: STATE_FILE } = config;
+  intentFile: INTENT_FILE, controlFile: CONTROL_FILE, stateFile: STATE_FILE } = config;
+const lab = new LabRun(runConfig);
+let closing = false, server, loopTimer, lastBoundArmed = false;
 
 // atomic write so the game never getFileReader's a half-written line
-function writeIntentFile(line) {
-  try {
-    const tmp = INTENT_FILE + '.tmp';
-    fs.writeFileSync(tmp, line + '\n');
-    fs.renameSync(tmp, INTENT_FILE);
-  } catch (e) { /* Lua dir may not exist until first launch */ }
+function atomicWrite(file, line) {
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, line + '\n', { mode: 0o600 });
+  fs.renameSync(tmp, file);
 }
+function writeIntentFile(line) { atomicWrite(INTENT_FILE, line); }
 
 // ---------- persistent state ----------
 let state = {
@@ -38,7 +41,7 @@ let state = {
   chat: [],                // two-way GOD channel: {from:'god'|'claude', text, t}
 };
 try { state = { ...state, ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) }; } catch {}
-const saveState = () => { try { fs.writeFileSync(STATE_FILE, JSON.stringify({ ...state, log: state.log.slice(-200) })); } catch {} };
+const saveState = () => { try { fs.writeFileSync(STATE_FILE, JSON.stringify({ ...state, lab: lab.snapshot(), log: state.log.slice(-200) })); } catch {} };
 
 let percept = null;         // last parsed percept
 let perceptAt = 0;          // percept file modification time, capped at the current time
@@ -85,7 +88,61 @@ function readPercept() {
   } catch { return false; /* keep last good for display, never for a new decision */ }
   finally { if (fd !== undefined) fs.closeSync(fd); }
 }
-setInterval(readPercept, 1000);
+const perceptTimer = setInterval(readPercept, 250);
+
+async function finishRun(reason) {
+  if (closing) return;
+  closing = true;
+  lab.stop(reason);
+  clearTimeout(loopTimer);
+  clearInterval(heartbeatTimer);
+  clearTimeout(durationTimer);
+  // DISARM is independent of any pending inference. Lua's short lease is the
+  // fallback if the process is killed, IPC fails, or the game stops ticking.
+  let disarmWritten = false;
+  const stopIssuedAt = Date.now();
+  try {
+    const line = lab.control('DISARM');
+    if (line) { atomicWrite(CONTROL_FILE, line); disarmWritten = true; }
+  } catch { /* report an unobserved stop instead of claiming completion */ }
+  const deadline = Date.now() + 3500;
+  let observed = false;
+  while (disarmWritten && Date.now() < deadline) {
+    if (readPercept() && lab.disarmObserved(percept, stopIssuedAt)) { observed = true; break; }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  clearInterval(perceptTimer);
+  state.finalObservation = percept;
+  state.disarmObserved = observed;
+  brainNote = `stopped: ${reason}; disarm ${observed ? 'observed' : 'unverified'}`;
+  log('stop', JSON.stringify({ reason, requests: lab.requests, disarmWritten, disarmObserved: observed,
+    session: percept?.session, armed: percept?.armed, lastSeq: percept?.lastSeq, qlen: percept?.qlen,
+    x: percept?.x, y: percept?.y, hp: percept?.hp }));
+  saveState();
+  if (server) server.close();
+  process.exit(observed || !lab.target ? 0 : 2);
+}
+
+function heartbeat() {
+  if (!runConfig.arm || closing) return;
+  if (lab.expired()) { void finishRun('duration_budget_exhausted'); return; }
+  if (!readPercept()) {
+    if (lab.target && Date.now() - (percept?.observed_ms || 0) > 3000) void finishRun('percept_unavailable');
+    return;
+  }
+  if (percept.dead) { void finishRun('survivor_dead'); return; }
+  if (!lab.valid(percept)) { void finishRun('unsupported_or_stale_lab_protocol'); return; }
+  if (!lab.bind(percept)) { if (lab.stopped) void finishRun(lab.reason); return; }
+  if (percept.armed && percept.labToken !== lab.token) { void finishRun('another_controller_owns_player'); return; }
+  if (lastBoundArmed && !percept.armed) { void finishRun('game_disarmed'); return; }
+  if (percept.armed) lastBoundArmed = true;
+  try { atomicWrite(CONTROL_FILE, lab.control()); }
+  catch { void finishRun('heartbeat_write_failed'); }
+}
+const heartbeatTimer = setInterval(heartbeat, 250);
+const durationTimer = runConfig.arm ? setTimeout(() => { void finishRun('duration_budget_exhausted'); }, runConfig.maxSeconds * 1000) : null;
+process.on('SIGINT', () => { void finishRun('signal_stop'); });
+process.on('SIGTERM', () => { void finishRun('signal_stop'); });
 
 // ---------- LLM backend (Ollama / Anthropic / OpenAI / Gemini / Claude CLI) ----------
 // The actual provider dispatch lives in llm.mjs; ccCall is a thin alias so the rest of the
@@ -103,8 +160,8 @@ const PERSONA = `You are Claude — the AI itself — controlling a survivor's b
 SENSES: hunger/thirst/fatigue/panic 0..1 (1=critical). hp 0..100. zClose=zombies within 10 tiles (DANGER), zNear=within 30. zDist/zDir=nearest zombie's distance & compass dir. qlen>0=body still walking. foods/waters=count in inventory. weapon=equipped. room=where you are. bldgDir/bldgDist=compass dir & tile distance to the nearest BUILDING (loot + shelter); "none" means only wilderness around you. Map: +x East, +y South (North = -dy).
 
 ACTIONS (one per turn):
-  MOVE dx dy  — walk relative tiles (-40..40 each). Explore/flee/approach.
-  LOOT        — walk to the nearest stocked container (~10 tiles) and grab food/water/useful items. Use often — it's how you get fed and armed.
+  MOVE dx dy — one nonzero integer offset, radius <=4 tiles. No momentum or automatic continuation.
+  LOOT        — walk to the nearest stocked container (within 4 tiles) and grab food/water/useful items. Use often — it's how you get fed and armed.
   EAT / DRINK — consume food / water from inventory (check foods>0 / waters>0).
   EQUIP       — equip your best weapon from inventory (do this once you loot one).
   CLOSEDOOR   — close the nearest open door (barrier between you and zombies as you retreat).
@@ -127,7 +184,7 @@ SURVIVAL DOCTRINE (you keep dying — follow this hard):
 - When you decide to hole up / rest / hide inside, CONCEAL first (closes doors + curtains so zombies don't see you), then WAIT.
 - NIGHT (hour < 7 or >= 20) is dangerous — you see poorly in the dark and it's easy to get lost or ambushed. Prefer to be holed up and concealed at night. A light lets you see but can draw attention; the body auto-manages a flashlight.
 
-PACING: never inch 1-3 tiles (you'll stand around) — commit to BIG moves (15-40 tiles). Almost never WAIT; if nothing's urgent, keep moving with PURPOSE toward your current subtask. Only WAIT to deliberately hide and say why.
+PACING: choose short purposeful steps (1-4 tiles total radius). Wait for actions to finish and inspect the result before choosing another. WAIT is appropriate while sheltering or when no useful supported action is safe.
 
 GOALS — you work toward ONE overarching goal, broken into subtasks:
 - Your MAJOR GOAL is a big multi-step objective (e.g. "Arm myself and secure a defensible house with a few days of food and water"). Hold to it. Do NOT abandon or swap it every turn — only replace it when it's genuinely ACHIEVED or has become impossible, and say why when you do.
@@ -147,7 +204,7 @@ Reply STRICT JSON only, no prose outside it:
  "memory":"REPLACE your scratchpad (<=400 chars): landmarks, what you have, lessons — NOT the goal (that's separate)"}`;
 
 async function decide() {
-  if (inFlight) return;
+  if (inFlight || closing || !runConfig.arm) return;
   if (!percept || !readPercept() || Date.now() - perceptAt > MAX_PERCEPT_AGE_MS) { brainNote = 'no fresh percept (game running? mod enabled?)'; return; }
 
   if (percept.dead) {
@@ -161,6 +218,9 @@ async function decide() {
     return;
   }
   eulogized = false;
+  if (!lab.ready(percept)) { brainNote = 'waiting for explicitly armed lab session'; return; }
+  if (percept.qlen > 0) { brainNote = 'waiting for the current timed action queue'; return; }
+  if (!lab.beginRequest(percept)) { if (lab.stopped) void finishRun(lab.reason); return; }
 
   inFlight = true;
   brainNote = 'thinking…';
@@ -192,10 +252,9 @@ CURRENT SENSES: ${JSON.stringify(percept)}
 Advance your subtask toward your goal. STRICT JSON only.`;
 
   try {
-    let out;
-    try { out = grabJSON(await ccCall(prompt)); }
-    catch (e1) { out = grabJSON(await ccCall(prompt)); }   // one retry — blips happen
-    // Inference (including its retry) may outlive the senses it used. Refresh from
+    const out = grabJSON(await ccCall(prompt)); // Exactly one provider call per counted attempt.
+    if (closing) return;
+    // Inference may outlive the senses it used. Refresh from
     // disk, not merely the one-second polling cache, before changing intent or memory.
     const decisionAge = Date.now() - decisionPerceptAt;
     if (decisionAge > MAX_PERCEPT_AGE_MS || decisionAge < -1000) {
@@ -203,30 +262,33 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     }
     if (!readPercept()) { discard('current percept is unreadable or stale'); return; }
     if (percept.dead) { discard('survivor is dead'); return; }
+    if (!lab.ready(percept)) { discard('lab session was revoked, changed, or expired'); return; }
+    if (percept.qlen !== 0) { discard('body became busy during inference'); return; }
     if (perceptSource.dev !== decisionSource.dev || perceptSource.ino !== decisionSource.ino) {
       discard('percept file was replaced during inference'); return;
     }
-    const a = out.action || { type: 'WAIT' };
-    const type = ['MOVE', 'LOOT', 'EAT', 'DRINK', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(a.type) ? a.type : 'WAIT';
-    const dx = Math.max(-40, Math.min(40, Math.round(Number(a.dx) || 0)));
-    const dy = Math.max(-40, Math.min(40, Math.round(Number(a.dy) || 0)));
-    // two-way GOD channel: if the voice spoke this turn, the survivor replies out loud
+    const a = out.action;
+    if (!a || typeof a !== 'object' || Array.isArray(a) || typeof a.type !== 'string'
+      || !['MOVE', 'LOOT', 'EAT', 'DRINK', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(a.type)) {
+      throw new Error('Model reply must contain one supported action object.');
+    }
+    const type = a.type, dx = a.dx, dy = a.dy;
     const reply = String(out.reply || '').replace(/[\r\n]/g, ' ').trim().slice(0, 120);
+    const say = String((god.length && reply) ? reply : (out.say || '')).replace(/[|\r\n]/g, ' ').slice(0, 90);
+    const thoughtField = String(out.thought || '').replace(/[|\r\n]/g, ' ').slice(0, 200);
+    const goalCandidate = String(out.subtask || out.goal || state.subtask || state.goal || '').trim().slice(0, 90);
+    const nextSeq = Math.max(state.seq, Number(percept.lastSeq) || 0) + 1;
+    const wire = lab.intent(percept, nextSeq, { type, dx, dy }, say, thoughtField, goalCandidate);
+    writeIntentFile(wire); // Do not accept model-authored state if publication fails.
     if (god.length && reply) {
       state.chat.push({ from: 'claude', text: reply, t: new Date().toISOString().slice(11, 19) });
       state.chat = state.chat.slice(-40);
       log('reply', reply);
     }
-    // speak the reply in-game (it takes priority over an ordinary remark this beat)
-    const say = String((god.length && reply) ? reply : (out.say || '')).replace(/[|\r\n]/g, ' ').slice(0, 90);
-    const thoughtField = String(out.thought || '').replace(/[|\r\n]/g, ' ').slice(0, 200);
-    // hold the major goal: only update it when the model actually returns one (never blank it out)
     if (out.goal && String(out.goal).trim()) state.goal = String(out.goal).trim().slice(0, 200);
     if (out.subtask && String(out.subtask).trim()) state.subtask = String(out.subtask).trim().slice(0, 120);
-    const goalField = String(state.subtask || state.goal || '').replace(/[|\r\n]/g, ' ').slice(0, 90);
-    state.seq++;
-    intentLine = `${state.seq}|${type}|${dx}|${dy}|${say}|${thoughtField}|${goalField}`;   // 6=thought, 7=goal/subtask (for HUD)
-    writeIntentFile(intentLine);                  // hand it to the game
+    state.seq = nextSeq;
+    intentLine = wire;
     lastThought = String(out.thought || '').slice(0, 500);
     lastAction = type === 'MOVE' ? `MOVE ${dx},${dy}` : type;
     if (out.memory) state.memory = String(out.memory).slice(0, 600);
@@ -234,10 +296,21 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     log('decide', `[${state.subtask}] ${lastAction}${say ? ` · "${say}"` : ''} — ${lastThought}`);
     saveState();
   } catch (e) {
-    brainNote = `brain error: ${e.message} (retrying next beat)`;
+    brainNote = `brain error: ${e.message} (attempt counted; no hidden retry)`;
     log('error', e.message);
   } finally {
     inFlight = false;
+    if (!closing && lab.stopped) { await finishRun(lab.reason); }
+    if (!closing && lab.requests >= runConfig.maxRequests) {
+      // Give the final accepted command a bounded opportunity to be consumed and
+      // complete. Queue completion is not an action-success receipt.
+      const deadline = Date.now() + 10000;
+      while (!closing && Date.now() < deadline && !lab.expired()) {
+        if (readPercept() && percept.lastSeq >= state.seq && percept.qlen === 0) break;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      if (!closing) await finishRun('request_budget_exhausted');
+    }
   }
 }
 
@@ -250,7 +323,7 @@ function cadence() {
   if (percept.qlen > 0) return 6000;     // still walking — let the body travel, check back soon
   return 4000;                            // idle & safe — decide promptly so he isn't standing around
 }
-(function loop() { decide().finally(() => setTimeout(loop, cadence())); })();
+loopTimer = setTimeout(function loop() { if (!closing) decide().finally(() => { if (!closing) loopTimer = setTimeout(loop, cadence()); }); }, 500);
 
 // ---------- web ----------
 const MIND_HTML = `<!doctype html><meta charset="utf-8"><title>Claude survives</title>
@@ -297,7 +370,7 @@ async function sendGod(){const i=document.getElementById('god');if(!i.value)retu
 setInterval(tick,2000);tick();
 </script>`;
 
-http.createServer((req, res) => {
+server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
   if (u.pathname === '/pz/intent') {
     res.writeHead(200, { 'content-type': 'text/plain' });
@@ -317,7 +390,7 @@ http.createServer((req, res) => {
   if (u.pathname === '/api/state') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({
-      percept, perceptFresh: Date.now() - perceptAt < 5000, seq: state.seq,
+      lab: lab.snapshot(), percept, perceptFresh: Date.now() - perceptAt < 5000, seq: state.seq,
       lastThought, lastSay: (intentLine.split('|')[4] || ''), lastAction, brainNote,
       goal: state.goal, subtask: state.subtask, chat: state.chat.slice(-24),
       memory: state.memory, log: state.log.slice(-60),
@@ -332,4 +405,5 @@ http.createServer((req, res) => {
   const address = this.address();
   log('boot', `pz-bridge up on http://${address.address}:${address.port}/mind — brain: ${BACKEND} (${MODEL}) — percept from ${PERCEPT_FILE}`);
   readPercept();
+  heartbeat();
 });
