@@ -823,6 +823,18 @@ end)
 
 -- These are visits observed from the actual body entry point. Path movement
 -- and completion are explicitly simulated; no engine route is being claimed.
+bodyTest("new session receipts outrank larger historical sequences",function()
+    local part=medicalBody();local supply=bandageSupply(95);command("BANDAGE",99)
+    dressed(part);consumeSupply(supply);queue={};advance(60)
+    assert(outcome("seq")==99 and outcome("status")=="observed_effect")
+    for _,fn in ipairs(handlers.mouse) do fn() end
+    advance(60);session=assert(percept("session"));heartbeat();tick();advance(60)
+    inventoryItems[#inventoryItems+1]=fixtureItem(96,"Food");statValues[CharacterStat.HUNGER]=0.4
+    command("EAT",1);advance(60)
+    assert(outcome("seq")==1 and outcome("action")=="EAT" and outcome("status")=="pending")
+    queue={};statValues[CharacterStat.HUNGER]=0.2;advance(60)
+    assert(outcome("seq")==1 and outcome("status")=="observed_effect")
+end)
 local function navigationText()
     return assert(assert(files["claude_percept.json"]):match('"navigation":(%b{})'),"missing navigation snapshot")
 end

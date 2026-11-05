@@ -214,5 +214,5 @@ test('Lua lab gate and actual body entry point enforce takeover',t=>{
   const result=spawnSync('lua',[script,directory],{encoding:'utf8',timeout:5000});
   if(result.error?.code==='ENOENT') { t.skip('Lua is not installed; gate engine stubs were not run.');return; }
   assert.equal(result.status,0,`${result.stdout}\n${result.stderr}`);
-  assert.match(result.stdout,/passed 71 lab Lua tests/);
+  assert.match(result.stdout,/passed 72 lab Lua tests/);
 });

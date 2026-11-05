@@ -367,10 +367,17 @@ local function buildPercept(p)
     j = j .. ',"dx":' .. bestLoot.dx .. ',"dy":' .. bestLoot.dy .. ',"distance":' .. bestLoot.distance
   end
   j = j .. '}'
-  local receipt = actionEvidence.receipt
-  if waterSkill.receipt and (not receipt or waterSkill.receipt.seq >= receipt.seq) then receipt=waterSkill.receipt end
-  if treatmentSkill.receipt and (not receipt or treatmentSkill.receipt.seq >= receipt.seq) then receipt=treatmentSkill.receipt end
-  if navigationSkill.receipt and (not receipt or navigationSkill.receipt.seq >= receipt.seq) then receipt=navigationSkill.receipt end
+  local receipt,historical=nil,nil
+  for _,candidate in pairs({actionEvidence.receipt,waterSkill.receipt,treatmentSkill.receipt,navigationSkill.receipt}) do
+    if candidate.world==lab.world and candidate.actor==lab.actor and candidate.session==lab.session then
+      if not receipt or candidate.seq>=receipt.seq then receipt=candidate end
+    elseif candidate.status~="pending" and (not historical or candidate.seq>=historical.seq) then
+      historical=candidate
+    end
+  end
+  -- Keep an interrupted receipt's original identity visible after takeover,
+  -- but an older session's larger sequence must never hide new pending work.
+  receipt=receipt or historical
   if receipt then
     j = j .. ',"actionOutcome":{"seq":' .. receipt.seq .. ',"action":"' .. esc(receipt.action)
       .. '","world":"' .. esc(receipt.world) .. '","actor":"' .. esc(receipt.actor)
