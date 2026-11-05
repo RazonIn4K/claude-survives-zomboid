@@ -5,9 +5,11 @@
 > momentum and automatic game-speed changes are disabled. Read
 > [the current lab protocol and startup instructions](bridge/README.md) before
 > using the older upstream feature descriptions below. An isolated B42.21 multiplayer
-> test observed looting and screwdriver equip; eating, drinking and combat remain
-> unverified in-game. The current update prioritizes safe food and pure water,
-> omits junk fallback, and reports inventory/needs evidence for LOOT/EAT/DRINK.
+> test observed looting and screwdriver equip. A subsequent scripted check of the
+> current body collected three food items and consumed one with a measured hunger
+> decrease; positive drinking and combat remain unverified. The current update
+> prioritizes safe food and pure water, omits junk fallback, and reports
+> inventory/needs evidence for LOOT/EAT/DRINK. See [lab results](docs/LAB-PLAYTEST.md).
 
 <div align="center">
 

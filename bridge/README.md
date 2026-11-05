@@ -35,14 +35,19 @@ settings. Initial ARM refuses a pre-existing timed-action queue; lease renewal
 can continue while the controller's own actions are queued. Existing local reflex,
 loot, eating, drinking, equipment and concealment functions run only while the
 lease is armed. The earlier bounded multiplayer run observed actual looting and
-screwdriver equip; eating, drinking and combat still need runtime validation.
+screwdriver equip. A subsequent scripted check collected three food items and
+consumed one with an observed hunger reduction. Positive drinking and combat
+remain untested. See [the bounded lab results](../docs/LAB-PLAYTEST.md).
 
 `bodyRevision="supplies-1"` identifies the current body update. LOOT ranks nearby
 safe edible food and pure clean water ahead of a single useful weapon fallback;
 it does not fill inventory with household clutter. Food checks match the official
 B42 inventory pane, including known poison and unsafe raw food checks. Unknown
 or hidden hazards can still exist. Nearby contents are proximity observations,
-not proof of visibility or an accessible route. `nearbyLoot` exposes these counts;
+not proof of visibility or an accessible route. In multiplayer, unrequested
+container lists can be empty while their actual contents remain unknown; a zero
+count does not establish an empty container or house. The current body does not
+request all container contents itself. `nearbyLoot` exposes these client counts;
 `inventoryCount` covers all items while the legacy names list remains capped at12.
 
 LOOT/EAT/DRINK publish `actionOutcome` with their original world/actor/session.
