@@ -56,6 +56,29 @@ test("heartbeat expiry revokes the session",function()
     clock=clock+1900; gate:update(player); clock=clock+101; gate:update(player)
     assert(not gate.armed and gate.session~=old and stops==1)
 end)
+test("fresh short leases continue past one hour while expiry and manual takeover still revoke",function()
+    control=table.concat({1,gate.session,world,actor,"bridge-token","ARM",clock,clock+3001},"|")
+    assert(not gate:update(player) and not gate.armed,"an oversized lease was accepted")
+    assert(arm());local original=gate.session
+    for _=1,14404 do
+        clock=clock+250
+        assert(arm(),"fresh heartbeat unexpectedly lost continuous control")
+        assert(gate.session==original and stops==0,"an absolute lifetime reset the session")
+    end
+    -- Keep ticks regular while allowing the final two-second lease to expire.
+    clock=clock+1900;gate:update(player);assert(gate.armed)
+    clock=clock+101;gate:update(player)
+    assert(not gate.armed and gate.reason=="heartbeat_expired" and gate.session~=original and stops==1)
+    assert(arm());local revokedSession,revokedToken=gate.session,gate.token
+    local pending=intent(1,"MOVE",1,0)
+    gate:manual()
+    for _=1,20 do
+        clock=clock+250
+        control=table.concat({1,revokedSession,world,actor,revokedToken,"ARM",clock,clock+2000},"|")
+        assert(not gate:update(player),"a revoked controller reacquired the player")
+    end
+    assert(not gate.armed and gate.reason=="manual_takeover" and stops==2 and not gate:accept(pending))
+end)
 test("world and actor changes revoke ownership",function()
     arm(); local old=gate.session; world="other-world"; gate:update(player)
     assert(not gate.armed and gate.session~=old)

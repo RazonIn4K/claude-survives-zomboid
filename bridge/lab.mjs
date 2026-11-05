@@ -12,13 +12,32 @@ function boundedInteger(env, name, fallback, maximum) {
 }
 
 export function labConfig(env = process.env) {
+  const mode = env.PZ_RUN_MODE === undefined ? 'lab' : env.PZ_RUN_MODE;
+  if (!['lab', 'autonomous', 'continuous'].includes(mode)) {
+    throw new Error('PZ_RUN_MODE must be lab, autonomous or continuous.');
+  }
   if (env.PZ_LAB_ARM !== undefined && !['0', '1'].includes(env.PZ_LAB_ARM)) {
     throw new Error('PZ_LAB_ARM must be 0 or 1; only 1 explicitly arms a lab session.');
   }
+  const autonomous = mode === 'autonomous';
+  const continuous = mode === 'continuous';
+  if (continuous && ['PZ_MAX_REQUESTS', 'PZ_MAX_SECONDS'].some(name => env[name] !== undefined)) {
+    throw new Error('Continuous mode does not accept PZ_MAX_REQUESTS or PZ_MAX_SECONDS.');
+  }
+  const expectedNames = ['PZ_EXPECTED_SESSION', 'PZ_EXPECTED_WORLD', 'PZ_EXPECTED_ACTOR'];
+  let expectedIdentity = null;
+  if (expectedNames.some(name => env[name] !== undefined)) {
+    if (!expectedNames.every(name => identity(env[name]))) {
+      throw new Error('Expected session, world and actor must all be valid identities.');
+    }
+    expectedIdentity = Object.freeze({session:env.PZ_EXPECTED_SESSION,world:env.PZ_EXPECTED_WORLD,actor:env.PZ_EXPECTED_ACTOR});
+  }
   return Object.freeze({
+    mode,
+    expectedIdentity,
     arm: env.PZ_LAB_ARM === '1',
-    maxRequests: boundedInteger(env, 'PZ_MAX_REQUESTS', 10, 10),
-    maxSeconds: boundedInteger(env, 'PZ_MAX_SECONDS', 120, 300),
+    maxRequests: continuous ? null : boundedInteger(env, 'PZ_MAX_REQUESTS', autonomous ? 120 : 10, autonomous ? 300 : 10),
+    maxSeconds: continuous ? null : boundedInteger(env, 'PZ_MAX_SECONDS', autonomous ? 1800 : 120, autonomous ? 3600 : 300),
   });
 }
 
@@ -44,6 +63,10 @@ export class LabRun {
 
   bind(percept) {
     if (!this.config.arm || this.stopped || !this.valid(percept)) return false;
+    if (!this.target && this.config.expectedIdentity && !same(this.config.expectedIdentity, percept)) {
+      this.stop('initial_session_changed');
+      return false;
+    }
     if (this.target && !same(this.target, percept)) {
       this.stop('game_session_changed');
       return false;
@@ -52,12 +75,12 @@ export class LabRun {
     return true;
   }
 
-  expired() { return this.now() - this.startedAt >= this.config.maxSeconds * 1000; }
+  expired() { return this.config.maxSeconds !== null && this.now() - this.startedAt >= this.config.maxSeconds * 1000; }
 
   control(action = 'ARM') {
     if (!this.target) return null;
     const issued = this.now();
-    const expires = action === 'DISARM' ? issued + 2000
+    const expires = action === 'DISARM' || this.config.maxSeconds === null ? issued + 2000
       : Math.min(issued + 2000, this.startedAt + this.config.maxSeconds * 1000);
     return [1, this.target.session, this.target.world, this.target.actor, this.token, action, issued, expires].join('|');
   }
@@ -76,7 +99,7 @@ export class LabRun {
 
   beginRequest(percept) {
     if (!this.ready(percept)) return false;
-    if (this.requests >= this.config.maxRequests) {
+    if (this.config.maxRequests !== null && this.requests >= this.config.maxRequests) {
       this.stop('request_budget_exhausted');
       return false;
     }
@@ -99,7 +122,8 @@ export class LabRun {
     }
     const safe = value => String(value).replace(/[|\r\n\0]/g, ' ').slice(0, 200);
     const issued = this.now();
-    const expires = Math.min(issued + 2000, this.startedAt + this.config.maxSeconds * 1000);
+    const expires = this.config.maxSeconds === null ? issued + 2000
+      : Math.min(issued + 2000, this.startedAt + this.config.maxSeconds * 1000);
     return [sequence, type, dx, dy, safe(say), safe(thought), safe(goal), 'LAB1',
       this.target.session, this.target.world, this.target.actor, this.token, issued, expires].join('|');
   }
@@ -107,7 +131,7 @@ export class LabRun {
   stop(reason) { this.stopped = true; this.reason = reason; }
 
   snapshot() {
-    return { armedOptIn: this.config.arm, target: this.target, requests: this.requests,
+    return { mode: this.config.mode, armedOptIn: this.config.arm, target: this.target, requests: this.requests,
       maxRequests: this.config.maxRequests, maxSeconds: this.config.maxSeconds,
       stopped: this.stopped, reason: this.reason };
   }

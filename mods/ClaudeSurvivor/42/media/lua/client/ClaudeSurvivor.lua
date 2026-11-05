@@ -286,7 +286,7 @@ local function buildPercept(p)
   local j = '{'
   j = j .. '"dead":' .. tostring(p:isDead())
   j = j .. ',"labProtocol":1,"armed":' .. tostring(lab.armed)
-  j = j .. ',"bodyRevision":"supplies-1"'
+  j = j .. ',"bodyRevision":"continuous-1"'
   j = j .. ',"session":"' .. esc(lab.session or "") .. '","world":"' .. esc(lab.world or "") .. '"'
   j = j .. ',"actor":"' .. esc(lab.actor or "") .. '","labToken":"' .. esc(lab.token or "") .. '"'
   j = j .. ',"observed_ms":' .. string.format("%.0f", tonumber(getTimestampMs()))

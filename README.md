@@ -1,6 +1,7 @@
 > **Laboratory fork update:** the installed Lua now starts disarmed. The bridge
-> defaults to observation only; explicitly set `PZ_LAB_ARM=1` to start a bounded
-> run (at most ten provider attempts and 300 seconds). Any key or mouse input
+> defaults to observation only; explicitly set `PZ_LAB_ARM=1` to arm it.
+> `PZ_RUN_MODE=continuous` has no duration or decision limit; the default `lab`
+> mode is capped at ten provider attempts and 300 seconds. Any key or mouse input
 > permanently revokes that session; there is no idle auto-resume. Movement
 > momentum and automatic game-speed changes are disabled. Read
 > [the current lab protocol and startup instructions](bridge/README.md) before

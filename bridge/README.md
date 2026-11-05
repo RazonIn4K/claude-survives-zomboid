@@ -6,10 +6,25 @@ This fork starts **monitor-only**. It makes no model requests and does not arm
 Lua unless `PZ_LAB_ARM=1` is explicitly set. The matching Lua starts disarmed;
 legacy intent lines and unmodified upstream percepts cannot control it.
 
-An explicitly armed run is limited to `PZ_MAX_REQUESTS` provider attempts (1–10,
-default 10) and `PZ_MAX_SECONDS` seconds (1–300, default 120), counted from bridge
-startup even if the game never supplies a percept. Failed HTTP calls, invalid
-JSON and discarded replies consume attempts. There is no automatic retry.
+An explicitly armed run selects one of three profiles with `PZ_RUN_MODE`:
+
+| Mode | Provider attempts | Duration |
+| --- | --- | --- |
+| `lab` (default) | Default 10, maximum 10 | Default 120 seconds, maximum 300 |
+| `autonomous` | Default 120, maximum 300 | Default 1800 seconds, maximum 3600 |
+| `continuous` | No cap | No cap |
+
+The bounded modes accept `PZ_MAX_REQUESTS` and `PZ_MAX_SECONDS`, counted from
+bridge startup. Continuous mode rejects those variables; omit them completely.
+Failed HTTP calls, invalid JSON and discarded replies count as attempts. Each
+loop iteration makes at most one provider call; a later iteration can try again
+after an error. Continuous mode keeps running independently of a chat session
+until stopped, revoked, disconnected or dead. It does not guarantee survival.
+
+Use `PZ_RUN_MODE=continuous PZ_LAB_ARM=1` with the same backend/path settings
+below for indefinite operation. Selecting a mode alone never arms the client.
+An independent process needs the game, server, model gateway and awake computer
+to remain available. No automatic login, respawn or restart is implemented.
 
 Example using an already running loopback OpenAI-compatible model gateway:
 
@@ -39,7 +54,9 @@ screwdriver equip. A subsequent scripted check collected three food items and
 consumed one with an observed hunger reduction. Positive drinking and combat
 remain untested. See [the bounded lab results](../docs/LAB-PLAYTEST.md).
 
-`bodyRevision="supplies-1"` identifies the current body update. LOOT ranks nearby
+`bodyRevision="continuous-1"` identifies the current body update, including removal
+of the former five-minute body lifetime. Renewed short leases can now continue
+without an absolute body cutoff. LOOT ranks nearby
 safe edible food and pure clean water ahead of a single useful weapon fallback;
 it does not fill inventory with household clutter. Food checks match the official
 B42 inventory pane, including known poison and unsafe raw food checks. Unknown
@@ -58,19 +75,31 @@ queue without an observed delta after a one-second synchronization grace;
 evidence or a30-second timeout. These receipts report observed changes, not proof
 of causation or that every requested transfer completed. The bridge waits for
 pending evidence before another decision and stores terminal receipts in
-`state.outcomes`. A final command remains subject to the ten-second/overall cap.
+`state.outcomes`. At a request cap, a final command gets at most ten seconds
+within the selected duration budget. Continuous mode has neither overall cap.
 
 **Any key or mouse input permanently disarms and rotates the session.** Idle
 input never automatically resumes the AI. Exit the stopped bridge and explicitly
 start another opted-in run to arm the new session. A missing heartbeat, pause/tick
-gap, player change, world change, death or duration cap also revokes control.
-Use Ctrl-C to request bridge shutdown. On finish, it stops heartbeat publication,
+gap, player change, world change, death or a selected duration cap also revokes
+control. Use Ctrl-C or the dashboard's **Stop AI** button to request shutdown.
+The Stop endpoint requires POST with the exact loopback dashboard origin and
+host; the other legacy dashboard endpoints still assume trusted local inputs.
+Optional `PZ_EXPECTED_SESSION`, `PZ_EXPECTED_WORLD` and `PZ_EXPECTED_ACTOR` must
+all be supplied together and prevent acquiring a replacement player at startup.
+On finish, it stops heartbeat publication,
 writes DISARM, and waits up to 3.5 seconds for a fresh unarmed percept from the
 same world and actor, an empty queue, and no reported queue-clear failure. The final
 state includes `lab.requests`, `lab.reason`, `finalObservation` and
 `disarmObserved`; a written stop command alone is not proof of disarming. An
 unobserved cleanup exits with status 2. The lease limits game-control duration;
 shutdown may use the extra observation window to record that control ended.
+
+`/api/state.run` reports mode, requests and remaining budgets; unlimited values
+are JSON `null`. Normal damage and critical needs do not stop continuous play.
+The separate bounded `autonomous` profile stops on a health drop of at least one
+point, hunger at 0.85 or thirst at 0.65. Both extended profiles reject invalid
+vitals. State history is kept as bounded rolling windows.
 
 The final intent gets at most ten seconds, within the overall lifetime, to be
 consumed and finish its timed-action queue. A consumed sequence and empty queue

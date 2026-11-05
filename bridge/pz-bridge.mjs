@@ -24,7 +24,7 @@ try {
 const { host: HOST, port: PORT, perceptFile: PERCEPT_FILE,
   intentFile: INTENT_FILE, controlFile: CONTROL_FILE, stateFile: STATE_FILE } = config;
 const lab = new LabRun(runConfig);
-let closing = false, server, loopTimer, lastBoundArmed = false;
+let closing = false, server, loopTimer, lastBoundArmed = false, baselineHealth = null;
 
 // atomic write so the game never getFileReader's a half-written line
 function atomicWrite(file, line) {
@@ -41,7 +41,7 @@ let state = {
   chat: [],                // two-way GOD channel: {from:'god'|'claude', text, t}
 };
 try { state = { ...state, ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) }; } catch {}
-const saveState = () => { try { fs.writeFileSync(STATE_FILE, JSON.stringify({ ...state, lab: lab.snapshot(), log: state.log.slice(-200) })); } catch {} };
+const saveState = () => { try { fs.writeFileSync(STATE_FILE, JSON.stringify({ ...state, lab: lab.snapshot(), run: sessionInfo(), log: state.log.slice(-200) })); } catch {} };
 
 let percept = null;         // last parsed percept
 let perceptAt = 0;          // percept file modification time, capped at the current time
@@ -53,9 +53,48 @@ let inFlight = false;
 let godQueue = [];          // messages from the /mind page, consumed next decision
 let eulogized = false;
 
+function sessionInfo() {
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - lab.startedAt) / 1000));
+  return { mode: runConfig.mode || 'lab', armedOptIn: runConfig.arm,
+    status: closing ? 'stopping' : (!runConfig.arm ? 'observing' : (percept?.armed ? 'playing' : 'waiting_for_game')),
+    requests: lab.requests, maxRequests: runConfig.maxRequests,
+    remainingRequests: runConfig.maxRequests === null ? null : Math.max(0, runConfig.maxRequests - lab.requests),
+    elapsedSeconds, maxSeconds: runConfig.maxSeconds,
+    remainingSeconds: runConfig.maxSeconds === null ? null : Math.max(0, runConfig.maxSeconds - elapsedSeconds), reason: lab.reason };
+}
+
+// The controller nonce belongs only to the file protocol, not model/dashboard input.
+function publicPercept() {
+  if (!percept) return null;
+  const { labToken, ...observation } = percept;
+  return observation;
+}
+
+function autonomousStopReason(observation) {
+  if (!['autonomous', 'continuous'].includes(runConfig.mode)) return null;
+  if (![observation.hp, observation.hunger, observation.thirst].every(Number.isFinite)
+    || observation.hp <= 0 || observation.hp > 100 || observation.hunger < 0 || observation.hunger > 1
+    || observation.thirst < 0 || observation.thirst > 1)
+    return 'invalid_survivor_vitals';
+  // Continuous play keeps attempting survival through normal damage and needs.
+  // Only the separately selected bounded profile uses health/needs stop thresholds.
+  if (runConfig.mode === 'continuous') return null;
+  baselineHealth ??= observation.hp;
+  if (baselineHealth - observation.hp >= 1) return 'survivor_health_reduced';
+  if (observation.hunger >= 0.85) return 'critical_hunger';
+  if (observation.thirst >= 0.65) return 'critical_thirst';
+  return null;
+}
+
+function initialIdentityMatches(observation) {
+  return lab.target || !runConfig.expectedIdentity
+    || ['session', 'world', 'actor'].every(key => observation[key] === runConfig.expectedIdentity[key]);
+}
+
 const log = (kind, text) => {
   const line = { t: new Date().toISOString().slice(11, 19), kind, text: String(text).slice(0, 400) };
   state.log.push(line);
+  if (state.log.length > 200) state.log.splice(0, state.log.length - 200);
   console.log(`[${line.t}] ${kind}: ${line.text}`);
 };
 
@@ -143,7 +182,10 @@ function heartbeat() {
   }
   if (percept.dead) { void finishRun('survivor_dead'); return; }
   if (!lab.valid(percept)) { void finishRun('unsupported_or_stale_lab_protocol'); return; }
+  if (!initialIdentityMatches(percept)) { void finishRun('initial_session_changed'); return; }
   if (!lab.bind(percept)) { if (lab.stopped) void finishRun(lab.reason); return; }
+  const stopReason = autonomousStopReason(percept);
+  if (stopReason) { void finishRun(stopReason); return; }
   if (percept.armed && percept.labToken !== lab.token) { void finishRun('another_controller_owns_player'); return; }
   if (lastBoundArmed && !percept.armed) { void finishRun('game_disarmed'); return; }
   if (percept.armed) lastBoundArmed = true;
@@ -151,7 +193,8 @@ function heartbeat() {
   catch { void finishRun('heartbeat_write_failed'); }
 }
 const heartbeatTimer = setInterval(heartbeat, 250);
-const durationTimer = runConfig.arm ? setTimeout(() => { void finishRun('duration_budget_exhausted'); }, runConfig.maxSeconds * 1000) : null;
+const durationTimer = runConfig.arm && runConfig.maxSeconds !== null
+  ? setTimeout(() => { void finishRun('duration_budget_exhausted'); }, runConfig.maxSeconds * 1000) : null;
 process.on('SIGINT', () => { void finishRun('signal_stop'); });
 process.on('SIGTERM', () => { void finishRun('signal_stop'); });
 
@@ -229,7 +272,10 @@ async function decide() {
     return;
   }
   eulogized = false;
+  if (!initialIdentityMatches(percept)) { void finishRun('initial_session_changed'); return; }
   if (!lab.ready(percept)) { brainNote = 'waiting for explicitly armed lab session'; return; }
+  const stopReason = autonomousStopReason(percept);
+  if (stopReason) { void finishRun(stopReason); return; }
   if (percept.qlen > 0) { brainNote = 'waiting for the current timed action queue'; return; }
   if (percept.actionOutcome?.status === 'pending') { brainNote = 'waiting for inventory or needs evidence'; return; }
   if (!lab.beginRequest(percept)) { if (lab.stopped) void finishRun(lab.reason); return; }
@@ -244,6 +290,7 @@ async function decide() {
     log('discard', reason);
     // Unanswered guidance belongs to the next decision that is actually accepted.
     godQueue.unshift(...god);
+    if (godQueue.length > 40) godQueue.splice(0, godQueue.length - 40);
   };
   // Keep this SHORT — prompt length is the dominant latency cost. Your `memory` field is the
   // real continuity; the log is just the last few beats so you don't repeat yourself.
@@ -259,7 +306,7 @@ YOUR MEMORY (you wrote this): ${state.memory}
 RECENT DECISIONS:
 ${recent}
 ${god.length ? '\nA VOICE FROM BEYOND (the researcher watching you) says: ' + god.map(g => `"${g}"`).join(' ') : ''}
-CURRENT SENSES: ${JSON.stringify(percept)}
+CURRENT SENSES: ${JSON.stringify(publicPercept())}
 
 Advance your subtask toward your goal. STRICT JSON only.`;
 
@@ -275,6 +322,8 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     if (!readPercept()) { discard('current percept is unreadable or stale'); return; }
     if (percept.dead) { discard('survivor is dead'); return; }
     if (!lab.ready(percept)) { discard('lab session was revoked, changed, or expired'); return; }
+    const stopReason = autonomousStopReason(percept);
+    if (stopReason) { await finishRun(stopReason); return; }
     if (percept.qlen !== 0) { discard('body became busy during inference'); return; }
     if (perceptSource.dev !== decisionSource.dev || perceptSource.ino !== decisionSource.ino) {
       discard('percept file was replaced during inference'); return;
@@ -313,7 +362,7 @@ Advance your subtask toward your goal. STRICT JSON only.`;
   } finally {
     inFlight = false;
     if (!closing && lab.stopped) { await finishRun(lab.reason); }
-    if (!closing && lab.requests >= runConfig.maxRequests) {
+    if (!closing && runConfig.maxRequests !== null && lab.requests >= runConfig.maxRequests) {
       // Give the final accepted command a bounded opportunity to be consumed and
       // complete. Queue completion is not an action-success receipt.
       const deadline = Date.now() + 10000;
@@ -349,6 +398,7 @@ h1{font-size:18px;color:#7fd1b9} .bubble{background:#1c2733;border-left:3px soli
 input{width:70%;background:#151b22;border:1px solid #26303a;color:#dde3ea;padding:8px;border-radius:6px}button{padding:8px 14px;border-radius:6px;border:0;background:#7fd1b9;color:#0c0f13;font-weight:600;cursor:pointer}
 .note{color:#8899aa;font-size:12px}</style>
 <h1>Claude survives — Project Zomboid</h1>
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><span class="note" id="session"></span><button id="stop-ai" hidden onclick="stopAI()" style="background:#e88787">Stop AI</button></div>
 <div class="note" id="note"></div>
 <div class="bubble" id="goal" style="border-left-color:#ffd479"><b style="color:#8899aa;font-size:11px;text-transform:uppercase;display:block">Goal</b><span id="goaltext"></span><div class="note" id="subtask" style="margin-top:4px"></div></div>
 <div class="bubble" id="thought"></div>
@@ -360,9 +410,12 @@ input{width:70%;background:#151b22;border:1px solid #26303a;color:#dde3ea;paddin
 <h1 style="font-size:14px;margin-top:16px">Log</h1>
 <div id="log"></div>
 <script>
+function escapeHTML(value){return String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));}
 function bar(label,v,inv){const pct=Math.round(v*100);const dang=(inv?v>0.7:v<0.3)?' danger':'';
 return '<div class="stat"><b>'+label+'</b>'+(inv?pct+'%':Math.round(v))+'<div class="bar'+dang+'"><i style="width:'+Math.min(100,pct)+'%"></i></div></div>'}
 async function tick(){try{const r=await fetch('/api/state');const s=await r.json();
+const run=s.run;document.getElementById('session').textContent=run.mode+' · '+run.status+' · '+(run.maxRequests===null?run.requests+' decisions · until stopped':run.requests+'/'+run.maxRequests+' decisions · '+Math.ceil(run.remainingSeconds/60)+' min remaining');
+const stop=document.getElementById('stop-ai');stop.hidden=!run.armedOptIn;stop.disabled=run.status==='stopping';
 document.getElementById('note').textContent='brain: '+s.brainNote+' · action: '+s.lastAction+' · seq '+s.seq+(s.percept?' · day '+s.percept.day+' '+String(s.percept.hour).padStart(2,'0')+':00 · '+s.percept.room:'');
 document.getElementById('goaltext').textContent=s.goal||'(setting a goal…)';
 document.getElementById('subtask').textContent=s.subtask?('▸ '+s.subtask):'';
@@ -374,16 +427,31 @@ bar('hp',p.hp/100*1,false).replace(/>\\d+</,'>'+p.hp+'<')+bar('hunger',p.hunger,
 '<div class="stat"><b>food items</b>'+p.foods+'</div>';}
 const chat=s.chat||[];const cbox=document.getElementById('chat');
 cbox.innerHTML=chat.map(function(m){var god=m.from==='god';
-return '<div style="align-self:'+(god?'flex-end':'flex-start')+';max-width:78%;background:'+(god?'#26303a':'#1c2733')+';border-left:3px solid '+(god?'#ffd479':'#7fd1b9')+';padding:6px 10px;border-radius:6px"><div style="font-size:10px;color:#8899aa;text-transform:uppercase">'+(god?'you':'him')+' · '+m.t+'</div>'+m.text+'</div>';}).join('');
+return '<div style="align-self:'+(god?'flex-end':'flex-start')+';max-width:78%;background:'+(god?'#26303a':'#1c2733')+';border-left:3px solid '+(god?'#ffd479':'#7fd1b9')+';padding:6px 10px;border-radius:6px"><div style="font-size:10px;color:#8899aa;text-transform:uppercase">'+(god?'you':'him')+' · '+escapeHTML(m.t)+'</div>'+escapeHTML(m.text)+'</div>';}).join('');
 cbox.scrollTop=cbox.scrollHeight;
 document.getElementById('log').textContent=s.log.map(l=>'['+l.t+'] '+l.kind+': '+l.text).reverse().join('\\n');
-}catch(e){}}
+}catch(e){document.getElementById('session').textContent='Connection lost — check session status';document.getElementById('stop-ai').disabled=true;}}
 async function sendGod(){const i=document.getElementById('god');if(!i.value)return;const t=i.value;i.value='';await fetch('/god?text='+encodeURIComponent(t));tick();}
+async function stopAI(){const button=document.getElementById('stop-ai');button.disabled=true;try{const response=await fetch('/control/stop',{method:'POST'});if(!response.ok)throw new Error('Stop request refused');document.getElementById('session').textContent='Stop requested — returning control to the game';}catch(error){button.disabled=false;document.getElementById('session').textContent=error.message;}}
 setInterval(tick,2000);tick();
 </script>`;
 
 server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
+  if (u.pathname === '/control/stop') {
+    if (req.method !== 'POST') { res.writeHead(405, { Allow: 'POST' }); return res.end(); }
+    const address = server.address();
+    const origin = `http://${HOST}:${address.port}`;
+    if (req.headers.origin !== origin || req.headers.host !== new URL(origin).host) {
+      res.writeHead(403); return res.end('Same-origin dashboard request required.');
+    }
+    if (!runConfig.arm) { res.writeHead(409); return res.end('This session is observation only.'); }
+    req.resume();
+    res.writeHead(202, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify({ status: 'stopping' }));
+    void finishRun('dashboard_stop');
+    return;
+  }
   if (u.pathname === '/pz/intent') {
     res.writeHead(200, { 'content-type': 'text/plain' });
     return res.end(intentLine + '\n');
@@ -392,6 +460,7 @@ server = http.createServer((req, res) => {
     const text = (u.searchParams.get('text') || '').slice(0, 300);
     if (text) {
       godQueue.push(text);
+      if (godQueue.length > 40) godQueue.splice(0, godQueue.length - 40);
       log('god', text);
       state.chat.push({ from: 'god', text, t: new Date().toISOString().slice(11, 19) });
       state.chat = state.chat.slice(-40);
@@ -400,9 +469,9 @@ server = http.createServer((req, res) => {
     res.writeHead(200); return res.end('ok');
   }
   if (u.pathname === '/api/state') {
-    res.writeHead(200, { 'content-type': 'application/json' });
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     return res.end(JSON.stringify({
-      lab: lab.snapshot(), percept, perceptFresh: Date.now() - perceptAt < 5000, seq: state.seq,
+      lab: lab.snapshot(), run: sessionInfo(), percept: publicPercept(), perceptFresh: Date.now() - perceptAt < 5000, seq: state.seq,
       lastThought, lastSay: (intentLine.split('|')[4] || ''), lastAction, brainNote,
       goal: state.goal, subtask: state.subtask, chat: state.chat.slice(-24),
       memory: state.memory, log: state.log.slice(-60),

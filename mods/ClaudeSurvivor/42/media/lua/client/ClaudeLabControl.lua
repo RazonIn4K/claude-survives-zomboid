@@ -22,7 +22,7 @@ local allowed = {MOVE=true, LOOT=true, EAT=true, DRINK=true, EQUIP=true,
 function ClaudeLabControl.new(env)
     local self = {armed=false, session=nil, world=nil, actor=nil, token="",
         reason="waiting_for_player", player=nil, lastSeq=0, leaseUntil=0,
-        armedAt=0, lastTick=nil, changed=true, counter=0, stopFailed=false}
+        lastTick=nil, changed=true, counter=0, stopFailed=false}
 
     function self:reset(player, reason)
         local wasArmed, previousPlayer = self.armed, self.player
@@ -67,7 +67,8 @@ function ClaudeLabControl.new(env)
             self:reset(player, "tick_gap")
         end
         self.lastTick = now
-        if self.armed and (now > self.leaseUntil or now - self.armedAt > 300000) then
+        -- Session duration belongs to the bridge mode; the body enforces each short lease.
+        if self.armed and now > self.leaseUntil then
             self:reset(player, "heartbeat_expired")
         end
         local moving = false
@@ -86,7 +87,7 @@ function ClaudeLabControl.new(env)
                         self.reason = "player_busy"
                         return false
                     end
-                    if not self.armed then self.armedAt = now; self.changed = true; self.stopFailed = false end
+                    if not self.armed then self.changed = true; self.stopFailed = false end
                     self.armed, self.token, self.leaseUntil = true, f[5], expires
                     self.reason = "bridge_armed"
                 elseif f[6] == "DISARM" and self.armed and f[5] == self.token then
