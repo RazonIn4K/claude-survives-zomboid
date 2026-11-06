@@ -127,7 +127,7 @@ Events={OnTick=event("tick"),OnKeyPressed=event("key"),OnMouseDown=event("mouse"
     OnGameStart=event("start"),OnCreatePlayer=event("create")}
 require=function(name)
     assert(name=="ClaudeLabControl" or name=="ClaudeLootPolicy" or name=="ClaudeActionEvidence"
-        or name=="ClaudeHealthFacts" or name=="ClaudeWindowPolicy" or name=="ClaudeWaterFacts"
+        or name=="ClaudeHealthFacts" or name=="ClaudeThreatFacts" or name=="ClaudeWindowPolicy" or name=="ClaudeWaterFacts"
         or name=="ClaudeWaterSkill" or name=="TimedActions/ClaudeTakeWaterAction"
         or name=="ClaudeTreatmentFacts" or name=="ClaudeTreatmentSkill" or name=="TimedActions/ClaudeApplyBandageAction"
         or name=="ClaudePlaceMemory" or name=="ClaudeNavigationSkill" or name=="Vehicles/TimedActions/ISPathFindAction")
@@ -596,7 +596,7 @@ end
 bodyTest("water observations and capabilities describe the prepared narrow skills",function()
     tap(101,100);waterVessel(70,0,1);advance(60)
     local text=assert(files["claude_percept.json"])
-    assert(text:find('"bodyRevision":"nav-1"',1,true))
+    assert(text:find('"bodyRevision":"priority-1"',1,true))
     assert(text:find('"tapDrinking":"safe_local_piped_only"',1,true))
     assert(text:find('"bottleFilling":"owned_compatible_vessel"',1,true))
     assert(text:find('"water":{',1,true) and text:find('"key":"101:100:0:0"',1,true))
@@ -739,10 +739,27 @@ end
 bodyTest("treatment observations advertise only supported self bandaging",function()
     medicalBody();bandageSupply(80);advance(60)
     local text=assert(files["claude_percept.json"])
-    assert(text:find('"bodyRevision":"nav-1"',1,true))
+    assert(text:find('"bodyRevision":"priority-1"',1,true))
     assert(text:find('"injuryTreatment":"self_bandage_simple_bleeding"',1,true))
+    assert(text:find('"idleSelfCare":"bandage_only"',1,true))
+    assert(text:find('"threats":{"valid":true,"status":"observed","scanned":0,"limit":16384,"error":null}',1,true))
     assert(text:find('"treatment":{',1,true) and text:find('"eligibleWounds":[{"index":0,"name":"Hand_L"}]',1,true))
     assert(text:find('"key":"item:80"',1,true) and text:find('"fullType":"Base.Bandage"',1,true))
+end)
+bodyTest("threat metadata and legacy distances describe the same complete or partial snapshot",function()
+    zombies={{getX=function() return 115.5 end,getY=function() return 100.5 end,
+        getZ=function() error("threat awareness must not filter floors") end}}
+    advance(60)
+    local text=assert(files["claude_percept.json"])
+    assert(text:find('"zTotal":1,"zNear":1,"zClose":0',1,true))
+    assert(text:find('"zDist":15.0,"zDir":"E"',1,true) or text:find('"zDist":15,"zDir":"E"',1,true))
+    assert(text:find('"threats":{"valid":true,"status":"observed","scanned":1',1,true))
+    zombies[2]={getX=function() return 0/0 end,getY=function() return 100 end}
+    advance(60)
+    text=assert(files["claude_percept.json"])
+    assert(text:find('"zTotal":2,"zNear":1,"zClose":0',1,true))
+    assert(text:find('"threats":{"valid":false,"status":"partial","scanned":1',1,true))
+    assert(text:find('"error":"threat_position_unknown"',1,true))
 end)
 bodyTest("BANDAGE connects native task and requires dressing plus exact supply consumption",function()
     local part=medicalBody();local item=bandageSupply(81)

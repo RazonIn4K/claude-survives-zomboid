@@ -9,7 +9,9 @@ const ACTIONS = new Set(['MOVE', 'NAVIGATE', 'LOOT', 'EAT', 'DRINK', 'DRINKTAP',
 const TERMINAL_STATUSES = ['observed_effect', 'arrived', 'no_effect', 'unverified', 'interrupted', 'native_failed'];
 const DECISION_REASONS = new Set(['invalid_json', 'unsupported_action', 'intent_rejected', 'intent_write_failed',
   'stale_percept', 'unreadable_percept', 'survivor_dead', 'session_changed', 'body_busy', 'pending_outcome',
-  'percept_replaced', 'controller_stopping', 'survivor_guard']);
+  'percept_replaced', 'controller_stopping', 'survivor_guard', 'local_action_superseded', 'command_pending',
+  'unchanged_self_care_failure']);
+const LOCAL_REASONS = new Set(['supported_bleeding_wound']);
 const FAILURE_CODES = new Set(['configuration_error', 'invalid_configuration', 'missing_credentials',
   'timeout', 'aborted', 'transport_error', 'network_error', 'http_error', 'invalid_response',
   'invalid_response_json', 'invalid_json', 'cli_error', 'unsupported_backend', 'provider_error']);
@@ -83,7 +85,7 @@ function outcomeSummary(value, observedAt) {
     if (Number.isFinite(value[key]) && Math.abs(value[key]) <= (key === 'finalZ' ? 100 : 1000000)) result[key] = value[key];
   }
   if (Number.isInteger(value.targetId) && value.targetId >= 1 && value.targetId <= 2147483647) result.targetId = value.targetId;
-  for (const key of ['bandaged', 'consumed']) if (typeof value[key] === 'boolean') result[key] = value[key];
+  for (const key of ['bandaged', 'consumed', 'bleedingAfter']) if (typeof value[key] === 'boolean') result[key] = value[key];
   return result;
 }
 
@@ -97,6 +99,7 @@ export class RunTelemetry {
   #correlationsEvicted = 0; #unresolvedEvicted = 0; #counterOverflow = false;
   #counters = { attempts: 0, responses: 0, providerFailures: 0, invalidDecisions: 0,
     discardedDecisions: 0, publicationFailures: 0, intentsPublished: 0,
+    modelIntentsPublished: 0, localIntentsPublished: 0,
     matchedReceipts: 0, observedEffects: 0, arrivals: 0 };
   #receiptStatuses = Object.fromEntries(TERMINAL_STATUSES.map(status => [status, 0]));
   #usage = Object.fromEntries(TOKEN_FIELDS.map(field => [field,
@@ -177,13 +180,28 @@ export class RunTelemetry {
     const attempt = this.#attempt(id);
     const identity = commandIdentity(value);
     if (!attempt || attempt.status !== 'response' || attempt.disposition !== null || !identity) return false;
+    if (!this.#publish(identity, 'model', id, null)) return false;
+    attempt.disposition = 'published'; attempt.command = identity;
+    return true;
+  }
+
+  // Deterministic self-care is a real command publication, not a model call.
+  // It shares the same identity/sequence fence and receipt ledger without
+  // inventing an attempt, provider response, or token-usage coverage.
+  publishLocalIntent(value, reason = 'supported_bleeding_wound') {
+    const identity = commandIdentity(value);
+    if (!identity || identity.action !== 'BANDAGE' || !LOCAL_REASONS.has(reason)) return false;
+    return this.#publish(identity, 'self_care', null, reason);
+  }
+
+  #publish(identity, origin, attemptId, reason) {
     if (identity.seq <= this.#highestPublishedSequence
         || (this.#publishedNamespace && !sameNamespace(this.#publishedNamespace, identity))) return false;
     this.#publishedNamespace ??= Object.fromEntries(['world', 'actor', 'session'].map(key => [key, identity[key]]));
     this.#highestPublishedSequence = identity.seq;
-    attempt.disposition = 'published'; attempt.command = identity;
-    this.#commands.set(commandKey(identity), { ...identity, attemptId: id, publishedAt: this.#time(), outcome: null });
+    this.#commands.set(commandKey(identity), { ...identity, origin, attemptId, reason, publishedAt: this.#time(), outcome: null });
     this.#increment(this.#counters, 'intentsPublished');
+    this.#increment(this.#counters, origin === 'model' ? 'modelIntentsPublished' : 'localIntentsPublished');
     if (this.#commands.size > this.#limit) {
       const oldest = this.#commands.keys().next().value;
       if (this.#commands.get(oldest).outcome === null) {

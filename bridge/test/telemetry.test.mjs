@@ -29,10 +29,13 @@ test('attempts, responses, publications and observed outcomes are separate evide
   assert.equal(run.observeOutcome(receipt(1, 'observed_effect', { added: 2 })), true);
   const snapshot = run.snapshot();
   assert.deepEqual(snapshot.counters, { attempts: 1, responses: 1, providerFailures: 0, invalidDecisions: 0,
-    discardedDecisions: 0, publicationFailures: 0, intentsPublished: 1, matchedReceipts: 1, observedEffects: 1, arrivals: 0 });
+    discardedDecisions: 0, publicationFailures: 0, intentsPublished: 1, modelIntentsPublished: 1,
+    localIntentsPublished: 0, matchedReceipts: 1, observedEffects: 1, arrivals: 0 });
   assert.equal(snapshot.unresolvedTracked, 0);
   assert.equal(snapshot.recentCommands[0].outcome.added, 2);
   assert.equal(snapshot.recentAttempts[0].disposition, 'published');
+  assert.equal(snapshot.recentCommands[0].origin, 'model');
+  assert.equal(snapshot.recentCommands[0].reason, null);
 });
 
 test('provider success counts usage even when decision is invalid, stale or cannot publish', () => {
@@ -305,4 +308,126 @@ test('invalid retention and clocks do not leak free-form errors into metadata', 
   assert.equal(snapshot.recentAttempts[0].metadata.latencyMs, null); assert.equal(snapshot.recentAttempts[0].metadata.httpStatus, null);
   assert.equal(snapshot.recentAttempts[0].errorCode, 'provider_error');
   assert.doesNotMatch(JSON.stringify(snapshot), /private-/);
+});
+
+test('local bandaging records a publication and receipt without fabricated model usage', () => {
+  const run = ledger();
+  const usageBefore = run.snapshot().usage;
+  assert.equal(run.publishLocalIntent(identity(1, 'BANDAGE')), true);
+  let snapshot = run.snapshot();
+  assert.deepEqual(snapshot.counters, { attempts: 0, responses: 0, providerFailures: 0, invalidDecisions: 0,
+    discardedDecisions: 0, publicationFailures: 0, intentsPublished: 1, modelIntentsPublished: 0,
+    localIntentsPublished: 1, matchedReceipts: 0, observedEffects: 0, arrivals: 0 });
+  assert.deepEqual(snapshot.usage, usageBefore);
+  assert.deepEqual(snapshot.recentAttempts, []);
+  assert.deepEqual(snapshot.recentCommands[0], { ...identity(1, 'BANDAGE'), origin: 'self_care',
+    attemptId: null, reason: 'supported_bleeding_wound', publishedAt: 1000, outcome: null });
+  assert.equal(run.observeOutcome(receipt(1, 'observed_effect', {
+    action: 'BANDAGE', bandaged: true, consumed: true, bleedingAfter: true,
+  })), true);
+  snapshot = run.snapshot();
+  assert.deepEqual(snapshot.recentCommands[0].outcome, { status: 'observed_effect', observedAt: 1000,
+    bandaged: true, consumed: true, bleedingAfter: true });
+  assert.equal(snapshot.counters.matchedReceipts, 1);
+  assert.equal(snapshot.counters.observedEffects, 1);
+  assert.deepEqual(snapshot.usage, usageBefore);
+  assert.equal(Object.hasOwn(snapshot.recentCommands[0].outcome, 'healed'), false);
+});
+
+test('model and local publications share one monotonic namespace and sequence fence', () => {
+  const run = ledger();
+  const id = run.beginAttempt(); run.recordResponse(id, metadata());
+  assert.equal(run.publishLocalIntent(identity(1, 'BANDAGE')), true);
+  assert.equal(run.publishIntent(id, identity(1, 'LOOT')), false);
+  assert.equal(run.snapshot().recentAttempts[0].disposition, null);
+  assert.equal(run.publishIntent(id, identity(2, 'LOOT')), true);
+  const snapshotBefore = run.snapshot();
+  for (const candidate of [identity(1, 'BANDAGE'), identity(2, 'BANDAGE'),
+    identity(3, 'BANDAGE', { world: 'other' }), identity(3, 'BANDAGE', { actor: 'other' }),
+    identity(3, 'BANDAGE', { session: 'other' })]) {
+    assert.equal(run.publishLocalIntent(candidate), false);
+    assert.deepEqual(run.snapshot(), snapshotBefore, 'rejected local publication must not mutate the ledger');
+  }
+  assert.equal(run.publishLocalIntent(identity(3, 'BANDAGE')), true);
+  const snapshot = run.snapshot();
+  assert.equal(snapshot.counters.intentsPublished, 3);
+  assert.equal(snapshot.counters.modelIntentsPublished, 1);
+  assert.equal(snapshot.counters.localIntentsPublished, 2);
+  assert.equal(snapshot.counters.attempts, 1);
+  assert.equal(snapshot.counters.responses, 1);
+  assert.equal(snapshot.usage.totalTokens.tokens, 15);
+  assert.equal(snapshot.highestPublishedSequence, 3);
+});
+
+test('local publications reject unsupported actions and reasons without allocating ledger state', () => {
+  const run = ledger();
+  const before = run.snapshot();
+  for (const command of [null, [], {}, identity(0, 'BANDAGE'), identity(1, 'EAT'), identity(1, 'DRINK'),
+    identity(1, 'WAIT'), identity(1, 'BANDAGE', { session: '' })]) {
+    assert.equal(run.publishLocalIntent(command), false);
+    assert.deepEqual(run.snapshot(), before);
+  }
+  for (const reason of ['', null, 1, {}, 'private-freeform-reason', 'x'.repeat(10000)]) {
+    assert.equal(run.publishLocalIntent(identity(1, 'BANDAGE'), reason), false);
+    assert.deepEqual(run.snapshot(), before);
+  }
+  assert.equal(run.publishLocalIntent(identity(1, 'BANDAGE'), 'supported_bleeding_wound'), true);
+});
+
+test('local receipts require exact identities and preserve the first terminal outcome', () => {
+  const run = ledger();
+  assert.equal(run.publishLocalIntent(identity(1, 'BANDAGE')), true);
+  for (const changes of [{ world: 'other' }, { actor: 'other' }, { session: 'other' }, { seq: 2 },
+    { action: 'EAT' }, { status: 'pending' }]) {
+    assert.equal(run.observeOutcome(receipt(1, 'observed_effect', { action: 'BANDAGE', ...changes })), false);
+  }
+  assert.equal(run.snapshot().counters.matchedReceipts, 0);
+  assert.equal(run.observeOutcome(receipt(1, 'unverified', { action: 'BANDAGE',
+    bleedingAfter: false, bandaged: 'true', consumed: 1 })), true);
+  assert.equal(run.observeOutcome(receipt(1, 'observed_effect', { action: 'BANDAGE',
+    bandaged: true, consumed: true, bleedingAfter: false })), false);
+  const snapshot = run.snapshot();
+  assert.equal(snapshot.counters.matchedReceipts, 1);
+  assert.equal(snapshot.counters.observedEffects, 0);
+  assert.equal(snapshot.receiptStatuses.unverified, 1);
+  assert.deepEqual(snapshot.recentCommands[0].outcome, { status: 'unverified', observedAt: 1000, bleedingAfter: false });
+});
+
+test('mixed-origin retention cannot resurrect evicted commands or invent model attempts', () => {
+  const run = ledger({ limit: 2 });
+  assert.equal(run.publishLocalIntent(identity(1, 'BANDAGE')), true);
+  const modelId = published(run, 2, 'LOOT');
+  assert.equal(run.observeOutcome(receipt(2)), true);
+  assert.equal(run.publishLocalIntent(identity(3, 'BANDAGE')), true);
+  assert.equal(run.observeOutcome(receipt(1, 'observed_effect', { action: 'BANDAGE' })), false);
+  assert.equal(run.publishLocalIntent(identity(1, 'BANDAGE')), false);
+  assert.equal(run.publishLocalIntent(identity(4, 'BANDAGE')), true);
+  assert.equal(run.publishIntent(modelId, identity(5)), false);
+  const snapshot = run.snapshot();
+  assert.equal(snapshot.recentCommands.length, 2);
+  assert.equal(snapshot.recentAttempts.length, 1);
+  assert.equal(snapshot.correlationsEvicted, 2);
+  assert.equal(snapshot.unresolvedEvicted, 1);
+  assert.equal(snapshot.counters.intentsPublished, 4);
+  assert.equal(snapshot.counters.modelIntentsPublished, 1);
+  assert.equal(snapshot.counters.localIntentsPublished, 3);
+  assert.equal(snapshot.counters.attempts, 1);
+  assert.equal(snapshot.counters.matchedReceipts, 1);
+  assert.equal(snapshot.unresolvedTracked, 2);
+  assert.equal(snapshot.highestPublishedSequence, 4);
+});
+
+test('priority-related discarded replies retain provider usage and explicit bounded reasons', () => {
+  const run = ledger();
+  for (const reason of ['local_action_superseded', 'command_pending']) {
+    const id = run.beginAttempt(); run.recordResponse(id, metadata());
+    assert.equal(run.rejectDecision(id, reason, 'discarded'), true);
+    assert.equal(run.snapshot().recentAttempts.at(-1).reason, reason);
+  }
+  const snapshot = run.snapshot();
+  assert.equal(snapshot.counters.discardedDecisions, 2);
+  assert.equal(snapshot.counters.responses, 2);
+  assert.equal(snapshot.usage.totalTokens.tokens, 30);
+  assert.equal(snapshot.counters.modelIntentsPublished, 0);
+  assert.equal(snapshot.counters.localIntentsPublished, 0);
 });

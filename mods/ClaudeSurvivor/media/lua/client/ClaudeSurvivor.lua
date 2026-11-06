@@ -31,6 +31,7 @@ require "ClaudeLabControl"
 require "ClaudeLootPolicy"
 require "ClaudeActionEvidence"
 require "ClaudeHealthFacts"
+require "ClaudeThreatFacts"
 require "ClaudeWindowPolicy"
 require "ClaudeWaterFacts"
 require "ClaudeWaterSkill"
@@ -225,28 +226,8 @@ end
 
 -- ---------- zombie awareness ----------
 local function zombieScan(px, py)
-  local zTotal, zNear, zClose, nearestD, ndx, ndy = 0, 0, 0, 9999, 0, 0
-  pcall(function()
-    local zl = getCell():getZombieList()
-    if zl then
-      zTotal = zl:size()
-      for i = 0, zTotal - 1 do
-        local z = zl:get(i)
-        local dx, dy = z:getX() - px, z:getY() - py
-        local d = math.sqrt(dx * dx + dy * dy)
-        if d < nearestD then nearestD, ndx, ndy = d, dx, dy end
-        if d <= 30 then zNear = zNear + 1 end
-        if d <= 10 then zClose = zClose + 1 end
-      end
-    end
-  end)
-  local dir = "-"
-  if zTotal > 0 then
-    local ew = ndx > 3 and "E" or (ndx < -3 and "W" or "")
-    local ns = ndy > 3 and "S" or (ndy < -3 and "N" or "")
-    dir = (ns .. ew ~= "") and (ns .. ew) or "HERE"
-  else nearestD = -1 end
-  return zTotal, zNear, zClose, nearestD, dir, ndx, ndy
+  local facts=ClaudeThreatFacts.read(px,py)
+  return facts.zTotal,facts.zNear,facts.zClose,facts.zDist,facts.zDir,facts.dx,facts.dy,facts
 end
 
 -- "where's civilization" sense so he heads toward buildings instead of wandering into open
@@ -281,7 +262,7 @@ local function buildPercept(p)
   local hp = 0
   pcall(function() hp = p:getBodyDamage():getOverallBodyHealth() end)
 
-  local zTotal, zNear, zClose, nearestD, nearestDir = zombieScan(px, py)
+  local zTotal, zNear, zClose, nearestD, nearestDir, _, _, threats = zombieScan(px, py)
 
   local room = "outside"
   pcall(function()
@@ -337,7 +318,7 @@ local function buildPercept(p)
   local j = '{'
   j = j .. '"dead":' .. tostring(p:isDead())
   j = j .. ',"labProtocol":1,"armed":' .. tostring(lab.armed)
-  j = j .. ',"bodyRevision":"nav-1"'
+  j = j .. ',"bodyRevision":"priority-1"'
   j = j .. ',"session":"' .. esc(lab.session or "") .. '","world":"' .. esc(lab.world or "") .. '"'
   j = j .. ',"actor":"' .. esc(lab.actor or "") .. '","labToken":"' .. esc(lab.token or "") .. '"'
   j = j .. ',"observed_ms":' .. string.format("%.0f", tonumber(getTimestampMs()))
@@ -349,7 +330,7 @@ local function buildPercept(p)
   j = j .. ',"room":"' .. esc(room) .. '"'
   j = j .. ',"hp":' .. n2(hp)
   j = j .. ',"health":' .. ClaudeHealthFacts.toJSON(health)
-  j = j .. ',"capabilities":{"injuryObservation":true,"injuryTreatment":"self_bandage_simple_bleeding","windowSmash":false,"windowTraverse":"adjacent_safe_only","tapDrinking":"safe_local_piped_only","bottleFilling":"owned_compatible_vessel","navigation":"same_room_clear_local_edges","placeMemory":"current_session"}'
+  j = j .. ',"capabilities":{"injuryObservation":true,"injuryTreatment":"self_bandage_simple_bleeding","windowSmash":false,"windowTraverse":"adjacent_safe_only","tapDrinking":"safe_local_piped_only","bottleFilling":"owned_compatible_vessel","navigation":"same_room_clear_local_edges","placeMemory":"current_session","idleSelfCare":"bandage_only"}'
   j = j .. ',"water":' .. ClaudeWaterFacts.toJSON(water)
   j = j .. ',"treatment":' .. ClaudeTreatmentFacts.toJSON(treatment)
   j = j .. ',"navigation":' .. ClaudePlaceMemory.toJSON(navigation)
@@ -357,6 +338,7 @@ local function buildPercept(p)
   j = j .. ',"endurance":' .. n2(endurance) .. ',"panic":' .. n2(panic)
   j = j .. ',"zTotal":' .. zTotal .. ',"zNear":' .. zNear .. ',"zClose":' .. zClose
   j = j .. ',"zDist":' .. n2(nearestD) .. ',"zDir":"' .. nearestDir .. '"'
+  j = j .. ',"threats":' .. ClaudeThreatFacts.toJSON(threats)
   j = j .. ',"foods":' .. foods .. ',"waters":' .. waters
   j = j .. ',"inventoryCount":' .. inventoryCount
   j = j .. ',"nearbyLoot":{"valid":' .. tostring(nearbyLoot.valid)

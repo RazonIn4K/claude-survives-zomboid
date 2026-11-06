@@ -13,6 +13,7 @@ import { callLLMResult, publicModelConfig } from './llm.mjs';
 import { loadBridgeConfig } from './config.mjs';
 import { LabRun, labConfig } from './lab.mjs';
 import { RunTelemetry } from './telemetry.mjs';
+import { PriorityCoordinator } from './priority.mjs';
 
 let config, runConfig;
 try {
@@ -27,6 +28,7 @@ const { host: HOST, port: PORT, perceptFile: PERCEPT_FILE,
 const lab = new LabRun(runConfig);
 // Process-local accounting is never restored from the model's saved memory.
 const telemetry = new RunTelemetry({ config: publicModelConfig() });
+const priority = new PriorityCoordinator({ enabled: runConfig.arm && runConfig.mode === 'continuous' });
 let closing = false, server, loopTimer, lastBoundArmed = false, baselineHealth = null;
 let publicationAccountingComplete = true;
 const telemetrySnapshot = () => ({ ...telemetry.snapshot(), publicationAccountingComplete });
@@ -46,7 +48,7 @@ let state = {
   chat: [],                // two-way GOD channel: {from:'god'|'claude', text, t}
 };
 try { state = { ...state, ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) }; } catch {}
-const saveState = () => { try { fs.writeFileSync(STATE_FILE, JSON.stringify({ ...state, lab: lab.snapshot(), run: sessionInfo(), telemetry: telemetrySnapshot(), log: state.log.slice(-200) })); } catch {} };
+const saveState = () => { try { fs.writeFileSync(STATE_FILE, JSON.stringify({ ...state, lab: lab.snapshot(), run: sessionInfo(), priority: priority.snapshot(), telemetry: telemetrySnapshot(), log: state.log.slice(-200) })); } catch {} };
 
 let percept = null;         // last parsed percept
 let perceptAt = 0;          // percept file modification time, capped at the current time
@@ -200,7 +202,52 @@ function heartbeat() {
   if (lastBoundArmed && !percept.armed) { void finishRun('game_disarmed'); return; }
   if (percept.armed) lastBoundArmed = true;
   try { atomicWrite(CONTROL_FILE, lab.control()); }
-  catch { void finishRun('heartbeat_write_failed'); }
+  catch { void finishRun('heartbeat_write_failed'); return; }
+  if (lab.ready(percept)) { updatePriority(); trySelfCare(); }
+}
+
+function updatePriority() {
+  const transition = priority.observe(percept);
+  if (!transition) return;
+  log('action', `Command coordination: ${transition.type}; ${transition.reason || 'result observed'}`);
+  saveState();
+  if (transition.type === 'blocked' && transition.reason === 'unexpected_sequence') {
+    void finishRun('unexpected_command_sequence');
+  }
+}
+
+// The heartbeat and model share this process's single publisher. Local care
+// never preempts a queued/native action or grants itself another control lease.
+function trySelfCare() {
+  if (closing || !lab.ready(percept)) return false;
+  const candidate = priority.candidate(percept);
+  if (!candidate) return false;
+  const nextSeq = Math.max(state.seq, Number(percept.lastSeq) || 0) + 1;
+  let wire;
+  try {
+    wire = lab.intent(percept, nextSeq, { type: candidate.action }, '', '', 'Apply a carried dressing');
+    writeIntentFile(wire);
+  } catch {
+    log('error', 'self_care_write_failed');
+    void finishRun('self_care_write_failed');
+    return true;
+  }
+  // Commit ownership immediately after publication, before optional diagnostics.
+  state.seq = nextSeq;
+  intentLine = wire;
+  lastAction = 'BANDAGE (automatic care)';
+  const command = { ...lab.target, seq: nextSeq, action: candidate.action };
+  if (!priority.published(command, { origin: 'self_care', candidate })) {
+    publicationAccountingComplete = false;
+    void finishRun('command_reservation_failed');
+    return true;
+  }
+  try {
+    if (!telemetry.publishLocalIntent(command, candidate.reason)) publicationAccountingComplete = false;
+  } catch { publicationAccountingComplete = false; }
+  log('self-care', `seq ${nextSeq}: BANDAGE for a supported bleeding wound; waiting for dressing and supply-consumption evidence`);
+  saveState();
+  return true;
 }
 const heartbeatTimer = setInterval(heartbeat, 250);
 const durationTimer = runConfig.arm && runConfig.maxSeconds !== null
@@ -296,6 +343,9 @@ async function decide() {
   if (!lab.ready(percept)) { brainNote = 'waiting for explicitly armed lab session'; return; }
   const stopReason = autonomousStopReason(percept);
   if (stopReason) { void finishRun(stopReason); return; }
+  updatePriority();
+  if (trySelfCare()) return;
+  if (priority.busy()) { brainNote = 'waiting for the published command and its evidence'; return; }
   if (!Number.isSafeInteger(percept.qlen) || percept.qlen < 0) { brainNote = 'waiting for a readable timed action queue'; return; }
   if (percept.nativeBusy !== false) { brainNote = 'waiting for native character action state'; return; }
   if (percept.qlen > 0) { brainNote = 'waiting for the current timed action queue'; return; }
@@ -307,6 +357,7 @@ async function decide() {
   brainNote = 'thinking…';
   const decisionPerceptAt = perceptAt;
   const decisionSource = perceptSource;
+  const decisionEpoch = priority.epoch;
   const god = godQueue.splice(0);
   const discard = (reason, code) => {
     telemetry.rejectDecision(attemptId, code, 'discarded');
@@ -332,6 +383,8 @@ RECENT DECISIONS:
 ${recent}
 ${god.length ? '\nA VOICE FROM BEYOND (the researcher watching you) says: ' + god.map(g => `"${g}"`).join(' ') : ''}
 CURRENT SENSES: ${JSON.stringify(publicPercept())}
+LOCAL CARE: ${JSON.stringify({ enabled: priority.snapshot().enabled, lastResult: priority.snapshot().lastResult, blocker: priority.snapshot().localBlocker })}
+In continuous mode an idle-body scheduler can apply a supported carried dressing while you think. It preserves your strategic goal, verifies the dressing and supply consumption, and discards your outdated reply after it acts. This does not mean the wound healed or bleeding stopped. Do not repeat an unchanged failed wound/supply pair; seek supplies or a safer supported next step.
 
 Advance your subtask toward your goal. STRICT JSON only.`;
 
@@ -341,6 +394,7 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     telemetry.recordResponse(attemptId, response.metadata);
     decisionStage = 'parse';
     if (closing) { discard('controller is stopping', 'controller_stopping'); return; }
+    if (priority.epoch !== decisionEpoch) { discard('automatic care changed the action plan', 'local_action_superseded'); return; }
     const out = grabJSON(response.text);
     // Inference may outlive the senses it used. Refresh from
     // disk, not merely the one-second polling cache, before changing intent or memory.
@@ -353,6 +407,13 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     if (!lab.ready(percept)) { discard('lab session was revoked, changed, or expired', 'session_changed'); return; }
     const stopReason = autonomousStopReason(percept);
     if (stopReason) { discard(stopReason, 'survivor_guard'); await finishRun(stopReason); return; }
+    updatePriority();
+    // A need can appear between heartbeat ticks. Resolve it before accepting a
+    // model plan based on an earlier observation, even if inference just ended.
+    if (trySelfCare() || priority.epoch !== decisionEpoch) {
+      discard('automatic care changed the action plan', 'local_action_superseded'); return;
+    }
+    if (priority.busy()) { discard('a published command is unresolved', 'command_pending'); return; }
     if (percept.qlen !== 0 || percept.nativeBusy !== false) { discard('body became busy during inference', 'body_busy'); return; }
     if (percept.actionOutcome?.status === 'pending') { discard('an action outcome became pending during inference', 'pending_outcome'); return; }
     if (perceptSource.dev !== decisionSource.dev || perceptSource.ino !== decisionSource.ino) {
@@ -365,6 +426,9 @@ Advance your subtask toward your goal. STRICT JSON only.`;
       throw new Error('Model reply must contain one supported action object.');
     }
     const type = a.type, dx = a.dx, dy = a.dy, targetId = a.targetId;
+    if (type === 'BANDAGE' && priority.blockedBandage(percept)) {
+      discard('the same wound and dressing already failed local care', 'unchanged_self_care_failure'); return;
+    }
     const reply = String(out.reply || '').replace(/[\r\n]/g, ' ').trim().slice(0, 120);
     const say = String((god.length && reply) ? reply : (out.say || '')).replace(/[|\r\n]/g, ' ').slice(0, 90);
     const thoughtField = String(out.thought || '').replace(/[|\r\n]/g, ' ').slice(0, 200);
@@ -377,6 +441,11 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     decisionStage = 'published';
     state.seq = nextSeq;
     intentLine = wire;
+    if (!priority.published({ ...lab.target, seq: nextSeq, action: type }, { origin: 'model' })) {
+      publicationAccountingComplete = false;
+      void finishRun('command_reservation_failed');
+      return;
+    }
     try {
       if (!telemetry.publishIntent(attemptId, { ...lab.target, seq: nextSeq, action: type })) {
         publicationAccountingComplete = false;
@@ -455,6 +524,7 @@ input{width:70%;background:#151b22;border:1px solid #26303a;color:#dde3ea;paddin
 <div class="note" id="usage"></div>
 <div class="note" id="model-response"></div>
 <div class="note" id="game-results"></div>
+<div id="local-care"></div>
 <div class="note">A published command is an attempt to act. Game receipts report observed effects or arrival; they do not establish general survival competence. Token counts are provider reports, not verified charges or quota.</div>
 </section>
 <div class="bubble" id="goal" style="border-left-color:#ffd479"><b style="color:#8899aa;font-size:11px;text-transform:uppercase;display:block">Model's proposed goal</b><span id="goaltext"></span><div class="note" id="subtask" style="margin-top:4px"></div></div>
@@ -480,6 +550,10 @@ const run=s.run;document.getElementById('session').textContent=run.mode+' · '+r
 const telemetry=s.telemetry;const counts=telemetry?.counters;const config=telemetry?.config;
 document.getElementById('provider').textContent=config?'Configured adapter: '+String(config.backend||'unknown')+' · endpoint origin: '+String(config.endpointOrigin||'unavailable')+' · authentication: '+String(config.authMode||'unknown')+' · requested model: '+String(config.requestedModel||'unavailable')+'. The adapter does not verify the upstream billing account.':'Provider details unavailable';
 document.getElementById('activity').textContent=counts?(telemetry.publicationAccountingComplete===false?'Incomplete publication accounting — counts may underreport. ':'')+'Attempts '+counts.attempts+' · responses '+counts.responses+' · commands published '+counts.intentsPublished+' · matched game receipts '+counts.matchedReceipts+' · observed effects '+counts.observedEffects+' · arrivals '+counts.arrivals:'Activity unavailable';
+const care=s.priority;const task=care?.reservation;const result=care?.lastResult;
+const careLabels={known_clear_reflex_radius_required:'Waiting for a complete threat scan with no nearby zombies',no_supported_bleeding_wound:'No supported injury needs a dressing',no_supported_clean_bandage:'Needs a clean carried dressing',unchanged_failed_treatment:'This wound and dressing already failed; new prerequisites are needed',command_not_acknowledged:'Waiting for the game to read the command',matching_terminal_receipt_required:'Waiting for the game result',body_not_known_idle:'Waiting for the current action to finish',receipt_timeout_unverified:'Result overdue; command remains blocked',dressing_and_supply_consumption_observed:'Dressing and supply consumption observed',settling_after_dressing:'Waiting for fresh observations after bandaging',complete_treatment_observation_required:'Wound or supply observation is incomplete',acknowledged_idle:'Acknowledged and idle; effect unverified'};
+const careText=value=>careLabels[value]||String(value||'unverified').replaceAll('_',' ');
+document.getElementById('local-care').textContent='Automatic bandaging: '+(care?.enabled?'enabled when idle':'disabled in this run mode')+' · local commands '+(counts?.localIntentsPublished||0)+' · model commands '+(counts?.modelIntentsPublished||0)+(task?' · waiting on '+(task.origin==='self_care'?'automatic care':'model')+' '+String(task.command?.action)+' #'+String(task.command?.seq):'')+(care?.blocker?' · '+careText(care.blocker):(care?.enabled&&care.localBlocker?' · '+careText(care.localBlocker):''))+(result?' · latest command '+String(result.action)+': '+careText(result.reason==='dressing_and_supply_consumption_observed'?result.reason:result.status):'')+'. A confirmed dressing does not establish healing or stopped bleeding.';
 const usage=telemetry?.usage;const tokenText=(field,label)=>{const item=usage?.[field];return label+': '+(item?.tokens===null||item?.tokens===undefined?'unknown':String(item.tokens))+' ('+(item?.reportedResponses||0)+'/'+(counts?.responses||0)+' responses report this field'+(item?.overflowed?', subtotal overflow':'')+')';};
 document.getElementById('usage').textContent='Reported token subtotals — '+tokenText('inputTokens','input')+' · '+tokenText('outputTokens','output')+' · '+tokenText('totalTokens','total')+'. Missing fields stay unknown; failures and unfinished requests may also have consumed usage.';
 const lastResponse=[...(telemetry?.recentAttempts||[])].reverse().find(item=>item.metadata);const meta=lastResponse?.metadata;
@@ -550,7 +624,7 @@ server = http.createServer((req, res) => {
   if (u.pathname === '/api/state') {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     return res.end(JSON.stringify({
-      lab: lab.snapshot(), run: sessionInfo(), telemetry: telemetrySnapshot(), percept: publicPercept(), perceptFresh: Date.now() - perceptAt < 5000, seq: state.seq,
+      lab: lab.snapshot(), run: sessionInfo(), priority: priority.snapshot(), telemetry: telemetrySnapshot(), percept: publicPercept(), perceptFresh: Date.now() - perceptAt < 5000, seq: state.seq,
       lastThought, lastSay: (intentLine.split('|')[4] || ''), lastAction, brainNote,
       goal: state.goal, subtask: state.subtask, chat: state.chat.slice(-24),
       memory: state.memory, log: state.log.slice(-60),

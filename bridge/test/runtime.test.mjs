@@ -132,7 +132,7 @@ function temporaryRun(t) {
 function fakeGame(run,extras={}) {
   const file=path.join(run.luaDir,'claude_percept.json');
   const game={file,paused:false,offset:0,state:{labProtocol:1,session:'fixture-session',world:'fixture-world',actor:'0',
-    labToken:'',armed:false,dead:false,stopFailed:false,nativeBusy:false,day:1,hour:9,hp:100,hunger:0.2,thirst:0.2,zClose:0,zNear:0,qlen:0,lastSeq:0,x:100,y:100,...extras}};
+    labToken:'',armed:false,dead:false,stopFailed:false,nativeBusy:false,traversingWindow:false,day:1,hour:9,hp:100,hunger:0.2,thirst:0.2,zClose:0,zNear:0,qlen:0,lastSeq:0,x:100,y:100,...extras}};
   game.publish=()=>{
     if(game.paused)return;
     const now=Date.now()+game.offset;
@@ -145,7 +145,7 @@ function fakeGame(run,extras={}) {
     }catch{}
     try {
       const f=fs.readFileSync(path.join(run.luaDir,'claude_intent.txt'),'utf8').trimEnd().split('|');
-      if(game.state.armed&&f.length===14&&f[8]===game.state.session&&f[9]===game.state.world
+      if(!game.holdIntent&&game.state.armed&&f.length===14&&f[8]===game.state.session&&f[9]===game.state.world
         &&f[10]===game.state.actor&&f[11]===game.state.labToken&&Number(f[13])>now&&Number(f[0])>game.state.lastSeq) {
         game.state.lastSeq=Number(f[0]);
         if(f[1]==='MOVE'){game.state.x+=Number(f[2]);game.state.y+=Number(f[3]);}
@@ -383,7 +383,9 @@ test('request budget stops the real bridge after two calls and observes disarm',
 
 test('dashboard guidance survives a discarded reply until the next accepted decision',{timeout:10000},async t=>{
   const run=temporaryRun(t);const game=fakeGame(run);const responses=[];
-  const endpoint=await model(run,(_req,res)=>{responses.push(res);});const processRun=startBridge(run,{OLLAMA_URL:endpoint.url});
+  const endpoint=await model(run,(_req,res)=>{responses.push(res);});
+  const cadence='const original=setTimeout;globalThis.setTimeout=(fn,ms,...a)=>original(fn,ms===4000?100:ms,...a);';
+  const processRun=startBridge(run,{OLLAMA_URL:endpoint.url},['--import',`data:text/javascript,${encodeURIComponent(cadence)}`]);
   const base=await boot(processRun);const guidance='synthetic guidance: stay beside the kitchen door';
   await fetch(`${base}/god?text=${encodeURIComponent(guidance)}`);const first=await waitFor(()=>responses[0],()=>processRun.output());
   fs.writeFileSync(game.file+'.new',JSON.stringify(game.state));fs.renameSync(game.file+'.new',game.file);reply(first);
@@ -613,4 +615,146 @@ test('continuous mode retains permanent manual takeover and truthful disconnecte
   const saved=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
   assert.equal(saved.lab.reason,'game_session_changed');assert.equal(saved.disarmObserved,true);
   assert.equal(saved.finalObservation.armed,false);assert.equal(fs.existsSync(path.join(run.luaDir,'claude_intent.txt')),false);
+});
+
+const priorityFacts=()=>({bodyRevision:'priority-1',capabilities:{idleSelfCare:'bandage_only'},
+  threats:{valid:true,status:'observed'},zTotal:0,zDist:-1,reflexed:false,traversingWindow:false,
+  treatment:{valid:true,status:'observed',eligibleWounds:[{index:0,name:'Hand_L'}],
+    supplies:[{key:'item:5',name:'Bandage',fullType:'Base.Bandage'}]}});
+const continuous={PZ_RUN_MODE:'continuous',PZ_MAX_REQUESTS:undefined,PZ_MAX_SECONDS:undefined,PZ_TIMEOUT:'10000'};
+function bandageReceipt(game,status='observed_effect',extra={}) {
+  const {world,actor,session,lastSeq:seq}=game.state;
+  return {world,actor,session,seq,action:'BANDAGE',status,partIndex:0,supplyKey:'item:5',
+    bandaged:status==='observed_effect',consumed:status==='observed_effect',bleedingAfter:true,...extra};
+}
+
+test('local care completes during inference and fences the old model action and memory',{timeout:10000},async t=>{
+  const run=temporaryRun(t);const game=fakeGame(run);let held;
+  const endpoint=await model(run,(_req,res)=>{held=res;});
+  const processRun=startBridge(run,{...continuous,OLLAMA_URL:endpoint.url});const base=await boot(processRun);
+  await waitFor(()=>held,()=>processRun.output());
+  Object.assign(game.state,priorityFacts());
+  game.onIntent=()=>{game.state.actionOutcome=bandageReceipt(game,'pending');};game.publish();
+  await waitFor(()=>game.state.lastSeq===1,()=>processRun.output());
+  const before=fs.readFileSync(path.join(run.luaDir,'claude_intent.txt'),'utf8');assert.match(before,/^1\|BANDAGE\|/);
+  game.state.actionOutcome=bandageReceipt(game);game.state.treatment.eligibleWounds=[];game.state.treatment.supplies=[];game.publish();
+  await waitFor(()=>JSON.parse(fs.readFileSync(run.stateFile,'utf8')).priority.reservation===null,()=>processRun.output());
+  reply(held,{action:{type:'MOVE',dx:2,dy:0},memory:'outdated memory',goal:'outdated goal',reply:'outdated reply'},
+    {prompt_eval_count:23,eval_count:4});
+  await waitFor(()=>JSON.parse(fs.readFileSync(run.stateFile,'utf8')).telemetry.counters.discardedDecisions===1,()=>processRun.output());
+  const saved=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
+  assert.equal(saved.seq,1);assert.equal(saved.memory,'(fresh mind — nothing yet)');assert.equal(saved.goal,'');
+  assert.equal(saved.chat.length,0);assert.equal(game.state.x,100);assert.equal(saved.priority.epoch,1);
+  assert.equal(saved.telemetry.counters.attempts,1);assert.equal(saved.telemetry.counters.responses,1);
+  assert.equal(saved.telemetry.counters.localIntentsPublished,1);assert.equal(saved.telemetry.counters.modelIntentsPublished,0);
+  assert.equal(saved.telemetry.counters.matchedReceipts,1);assert.equal(saved.telemetry.usage.inputTokens.tokens,23);
+  assert.equal(saved.telemetry.recentAttempts[0].reason,'local_action_superseded');
+  assert.equal(fs.readFileSync(path.join(run.luaDir,'claude_intent.txt'),'utf8'),before);
+  const s=await(await fetch(`${base}/api/state`)).json();const html=await(await fetch(`${base}/mind`)).text();
+  assert.equal(s.lastAction,'BANDAGE (automatic care)');
+  const elements=new Map();const document={getElementById(id){if(!elements.has(id))elements.set(id,{});return elements.get(id);}};
+  await runInNewContext(html.match(/<script>([\s\S]*?)<\/script>/)[1],{document,fetch:async()=>({json:async()=>s}),setInterval:()=>0});
+  assert.match(elements.get('local-care').textContent,/local commands 1.*model commands 0/);
+  assert.match(elements.get('local-care').textContent,/does not establish healing or stopped bleeding/);
+});
+
+test('unacknowledged model intent reserves the slot even while the body still looks idle',{timeout:7000},async t=>{
+  const run=temporaryRun(t);const game=fakeGame(run);game.holdIntent=true;
+  const endpoint=await model(run,(_req,res)=>reply(res));
+  const processRun=startBridge(run,{...continuous,OLLAMA_URL:endpoint.url});await boot(processRun);
+  const intent=path.join(run.luaDir,'claude_intent.txt');await waitFor(()=>fs.existsSync(intent),()=>processRun.output());
+  const before=fs.readFileSync(intent,'utf8');Object.assign(game.state,priorityFacts());game.publish();
+  await delay(600);assert.equal(game.state.lastSeq,0);assert.equal(fs.readFileSync(intent,'utf8'),before);
+  assert.equal(endpoint.calls.length,1);
+  game.onIntent=f=>{if(f[1]==='BANDAGE')game.state.actionOutcome=bandageReceipt(game,'pending');};
+  game.holdIntent=false;game.publish();
+  await waitFor(()=>game.state.lastSeq===2,()=>processRun.output());assert.match(fs.readFileSync(intent,'utf8'),/^2\|BANDAGE\|/);
+});
+
+test('failed automatic care blocks the same pair but lets the model plan a different task',{timeout:8000},async t=>{
+  const run=temporaryRun(t);const game=fakeGame(run,priorityFacts());let held;
+  game.onIntent=()=>{game.state.actionOutcome=bandageReceipt(game,'pending');};
+  const endpoint=await model(run,(_req,res)=>{held=res;});
+  const fast='const original=setTimeout;globalThis.setTimeout=(fn,ms,...a)=>original(fn,ms===4000?100:ms,...a);';
+  const processRun=startBridge(run,{...continuous,OLLAMA_URL:endpoint.url},['--import',`data:text/javascript,${encodeURIComponent(fast)}`]);
+  await boot(processRun);await waitFor(()=>game.state.lastSeq===1,()=>processRun.output());
+  assert.equal(endpoint.calls.length,0,'local bandage should not require a model call');
+  const before=fs.readFileSync(path.join(run.luaDir,'claude_intent.txt'),'utf8');
+  game.state.actionOutcome=bandageReceipt(game,'no_effect');game.publish();
+  await waitFor(()=>held,()=>processRun.output());
+  assert.match(endpoint.calls[0].body.messages[0].content,/LOCAL CARE:/);
+  reply(held,{action:{type:'BANDAGE'},memory:'must not repeat'});
+  await waitFor(()=>JSON.parse(fs.readFileSync(run.stateFile,'utf8')).telemetry.counters.discardedDecisions===1,()=>processRun.output());
+  const saved=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
+  assert.equal(saved.seq,1);assert.equal(saved.telemetry.recentAttempts[0].reason,'unchanged_self_care_failure');
+  assert.equal(saved.memory,'(fresh mind — nothing yet)');assert.equal(fs.readFileSync(path.join(run.luaDir,'claude_intent.txt'),'utf8'),before);
+});
+
+test('local publication failure stops without advancing epoch or counting a command',{timeout:6000},async t=>{
+  const run=temporaryRun(t);const game=fakeGame(run);let held;
+  const endpoint=await model(run,(_req,res)=>{held=res;});
+  const processRun=startBridge(run,{...continuous,OLLAMA_URL:endpoint.url});await boot(processRun);
+  await waitFor(()=>held,()=>processRun.output());fs.mkdirSync(path.join(run.luaDir,'claude_intent.txt'));
+  Object.assign(game.state,priorityFacts());game.publish();
+  const[code]=await processRun.exited;assert.equal(code,0);
+  const saved=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
+  assert.equal(saved.lab.reason,'self_care_write_failed');assert.equal(saved.priority.epoch,0);
+  assert.equal(saved.seq,0);assert.equal(saved.telemetry.counters.intentsPublished,0);assert.equal(saved.disarmObserved,true);
+});
+
+test('monitor and bounded modes never perform automatic care',{timeout:6000},async t=>{
+  await Promise.all([{PZ_LAB_ARM:'0'},{PZ_RUN_MODE:'lab'},{PZ_RUN_MODE:'autonomous'}].map(overrides=>t.test(JSON.stringify(overrides),async t=>{
+    const run=temporaryRun(t);fakeGame(run,priorityFacts());const endpoint=await model(run,(_req,res)=>reply(res));
+    const processRun=startBridge(run,{...overrides,OLLAMA_URL:endpoint.url,PZ_MAX_SECONDS:'1'});const base=await boot(processRun);
+    await delay(650);const saved=await(await fetch(`${base}/api/state`)).json();
+    assert.equal(saved.priority.enabled,false);assert.equal(saved.telemetry.counters.localIntentsPublished,0);
+    if(fs.existsSync(path.join(run.luaDir,'claude_intent.txt')))assert.match(fs.readFileSync(path.join(run.luaDir,'claude_intent.txt'),'utf8'),/^1\|WAIT\|/);
+  })));
+});
+
+test('a post-write reservation failure stops and marks publication accounting incomplete',{timeout:6000},async t=>{
+  await Promise.all(['model','self_care'].map(origin=>t.test(origin,async t=>{
+    const run=temporaryRun(t);fakeGame(run,origin==='self_care'?priorityFacts():{});
+    const endpoint=await model(run,(_req,res)=>reply(res));
+    const preload=`import {PriorityCoordinator} from ${JSON.stringify(new URL('../priority.mjs',import.meta.url).href)};PriorityCoordinator.prototype.published=()=>false;`;
+    const processRun=startBridge(run,{...continuous,OLLAMA_URL:endpoint.url},['--import',`data:text/javascript,${encodeURIComponent(preload)}`]);
+    const[code]=await processRun.exited;assert.equal(code,0);
+    const saved=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
+    assert.equal(saved.lab.reason,'command_reservation_failed');assert.equal(saved.seq,1);
+    assert.equal(saved.telemetry.publicationAccountingComplete,false);assert.equal(saved.telemetry.counters.publicationFailures,0);
+    assert.equal(saved.disarmObserved,true);assert.ok(fs.existsSync(path.join(run.luaDir,'claude_intent.txt')));
+  })));
+});
+
+test('regressed idle observations pause both publishers until the command sequence catches up',{timeout:6000},async t=>{
+  const run=temporaryRun(t);const game=fakeGame(run);let held;
+  game.onIntent=()=>{game.holdIntent=true;};
+  const endpoint=await model(run,(_req,res,_body,count)=>{if(count===1)reply(res);else held=res;});
+  const fast='const original=setTimeout;globalThis.setTimeout=(fn,ms,...a)=>original(fn,ms===4000?500:ms,...a);';
+  const processRun=startBridge(run,{...continuous,OLLAMA_URL:endpoint.url},['--import',`data:text/javascript,${encodeURIComponent(fast)}`]);
+  await boot(processRun);await waitFor(()=>game.state.lastSeq===1,()=>processRun.output());
+  await waitFor(()=>JSON.parse(fs.readFileSync(run.stateFile,'utf8')).priority.reservation===null,()=>processRun.output());
+  Object.assign(game.state,priorityFacts(),{lastSeq:0});game.publish();
+  const intent=path.join(run.luaDir,'claude_intent.txt');const before=fs.readFileSync(intent,'utf8');
+  await waitFor(()=>JSON.parse(fs.readFileSync(run.stateFile,'utf8')).priority.blocker==='sequence_regressed',()=>processRun.output());
+  await delay(600);assert.equal(endpoint.calls.length,1);assert.equal(fs.readFileSync(intent,'utf8'),before);
+  game.state.lastSeq=1;game.state.treatment.eligibleWounds=[];game.publish();
+  await waitFor(()=>held,()=>processRun.output());assert.equal(endpoint.calls.length,2);
+});
+
+test('unexpected sequence advancement disarms and prevents pending model state acceptance',{timeout:6000},async t=>{
+  const run=temporaryRun(t);const game=fakeGame(run);let held;
+  const endpoint=await model(run,(_req,res,_body,count)=>{if(count===1)reply(res);else held=res;});
+  const fast='const original=setTimeout;globalThis.setTimeout=(fn,ms,...a)=>original(fn,ms===4000?100:ms,...a);';
+  const processRun=startBridge(run,{...continuous,OLLAMA_URL:endpoint.url},['--import',`data:text/javascript,${encodeURIComponent(fast)}`]);
+  await boot(processRun);await waitFor(()=>held,()=>processRun.output());
+  const intent=path.join(run.luaDir,'claude_intent.txt');const before=fs.readFileSync(intent,'utf8');
+  game.state.lastSeq=99;game.publish();
+  await waitFor(()=>!game.state.armed,()=>processRun.output());
+  reply(held,{action:{type:'MOVE',dx:2,dy:0},memory:'foreign command must not be accepted',reply:'late reply'});
+  const[code]=await processRun.exited;assert.equal(code,0);
+  const saved=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
+  assert.equal(saved.lab.reason,'unexpected_command_sequence');assert.equal(saved.priority.authorityFault,true);
+  assert.equal(saved.disarmObserved,true);assert.equal(saved.seq,1);assert.equal(saved.memory,'synthetic-state');
+  assert.equal(saved.chat.length,0);assert.equal(fs.readFileSync(intent,'utf8'),before);
 });
