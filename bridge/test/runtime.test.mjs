@@ -31,6 +31,9 @@ test('pending evidence settles before cleanup and receipts retain their original
   assert.equal(state.outcomes[0].session,origin.session);
   assert.equal(state.outcomes[0].world,origin.world);assert.equal(state.outcomes[0].actor,origin.actor);
   assert.equal(state.outcomes[0].added,1);assert.equal(state.finalObservation.session,'fixture-stopped');
+  assert.equal(state.telemetry.counters.intentsPublished,1);
+  assert.equal(state.telemetry.counters.matchedReceipts,1);
+  assert.equal(state.telemetry.counters.observedEffects,1);
 });
 
 test('unresolved existing evidence prevents a gameplay model request',{timeout:4000},async t=>{
@@ -69,6 +72,9 @@ test('survival skills retain measured outcomes through the real bridge transport
     assert.equal(state.outcomes[0].amountGain,type==='FILLBOTTLE'?2:0);
     if(type==='BANDAGE')assert.equal(state.outcomes[0].consumed,true);
     if(type==='NAVIGATE'){assert.equal(state.outcomes[0].status,'arrived');assert.equal(state.outcomes[0].targetId,7);assert.equal(state.navigation.anchors[0].id,7);}
+    assert.equal(state.telemetry.counters.matchedReceipts,1);
+    assert.equal(state.telemetry.counters.observedEffects,type==='NAVIGATE'?0:1);
+    assert.equal(state.telemetry.counters.arrivals,type==='NAVIGATE'?1:0);
     assert.equal(state.disarmObserved,true);
   })));
 });
@@ -172,9 +178,9 @@ async function boot(processRun) {
   const match=await waitFor(()=>processRun.output().match(/pz-bridge up on http:\/\/([^\s/]+)\/mind/),()=>processRun.output(),3000);
   assert.match(match[1],/^127\.0\.0\.1:\d+$/);return`http://${match[1]}`;
 }
-function reply(res,decision={action:{type:'WAIT'},memory:'synthetic-state'}) {
+function reply(res,decision={action:{type:'WAIT'},memory:'synthetic-state'},metadata={}) {
   res.writeHead(200,{'content-type':'application/json',connection:'close'});
-  res.end(JSON.stringify({message:{content:JSON.stringify(decision)}}));
+  res.end(JSON.stringify({...metadata,message:{content:JSON.stringify(decision)}}));
 }
 async function model(run,handler) {
   const calls=[];
@@ -192,7 +198,7 @@ test('explicit lab handshake completes a synthetic model cycle with bound intent
   const endpoint=await model(run,(_req,res)=>reply(res,{action:{type:'MOVE',dx:2,dy:-1},say:'synthetic smoke',
     thought:'fixture only',goal:'temporary test run',subtask:'stay isolated',memory:'synthetic-state'}));
   const processRun=startBridge(run,{OLLAMA_URL:endpoint.url});const base=await boot(processRun);
-  await waitFor(()=>fs.existsSync(run.stateFile),()=>processRun.output());
+  await waitFor(()=>game.state.lastSeq===1,()=>processRun.output());
   assert.equal(endpoint.calls.length,1);assert.equal(endpoint.calls[0].url,'/api/chat');
   assert.equal(endpoint.calls[0].body.model,'synthetic-fixture');assert.match(endpoint.calls[0].body.messages[0].content,/isolated-runtime/);
   const wire=fs.readFileSync(path.join(run.luaDir,'claude_intent.txt'),'utf8');
@@ -276,11 +282,84 @@ test('unsafe context changes cannot publish a delayed model decision',{timeout:1
 
 test('invalid model JSON counts one attempt and has no hidden retry',{timeout:6000},async t=>{
   const run=temporaryRun(t);fakeGame(run);
-  const endpoint=await model(run,(_req,res)=>{res.writeHead(200,{'content-type':'application/json',connection:'close'});res.end(JSON.stringify({message:{content:'invalid JSON'}}));});
+  const endpoint=await model(run,(_req,res)=>{res.writeHead(200,{'content-type':'application/json',connection:'close'});res.end(JSON.stringify({model:'reported-fixture',prompt_eval_count:12,eval_count:0,message:{content:'{private-invalid-fixture-reply}'}}));});
   const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_REQUESTS:'1'});const[code]=await processRun.exited;
   assert.equal(code,0);assert.equal(endpoint.calls.length,1);const state=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
   assert.equal(state.lab.requests,1);assert.equal(state.disarmObserved,true);assert.equal(state.seq,0);
   assert.equal(fs.existsSync(path.join(run.luaDir,'claude_intent.txt')),false);
+  assert.equal(state.telemetry.counters.attempts,1);assert.equal(state.telemetry.counters.responses,1);
+  assert.equal(state.telemetry.counters.invalidDecisions,1);assert.equal(state.telemetry.counters.intentsPublished,0);
+  assert.equal(state.telemetry.usage.inputTokens.tokens,12);assert.equal(state.telemetry.usage.outputTokens.tokens,0);
+  assert.equal(state.telemetry.usage.totalTokens.tokens,null);
+  assert.doesNotMatch(processRun.output()+JSON.stringify(state),/private-invalid-fixture-reply/);
+});
+
+test('model metadata survives a discarded reply without becoming game progress',{timeout:6000},async t=>{
+  const run=temporaryRun(t);const game=fakeGame(run);let held;
+  const endpoint=await model(run,(_req,res)=>{held=res;});
+  const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_REQUESTS:'1'});
+  await boot(processRun);await waitFor(()=>held,()=>processRun.output());
+  game.state.qlen=1;game.publish();
+  reply(held,{action:{type:'WAIT'}},{model:'reported-fixture',prompt_eval_count:20,eval_count:4});
+  await waitFor(()=>/discard:/.test(processRun.output()),()=>processRun.output());
+  game.state.qlen=0;game.publish();await processRun.exited;
+  const state=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
+  assert.equal(state.telemetry.counters.responses,1);assert.equal(state.telemetry.counters.discardedDecisions,1);
+  assert.equal(state.telemetry.counters.intentsPublished,0);assert.equal(state.telemetry.counters.matchedReceipts,0);
+  assert.equal(state.telemetry.usage.inputTokens.tokens,20);assert.equal(state.telemetry.usage.outputTokens.tokens,4);
+});
+
+test('publication failure records a consumed response but no command or accepted memory',{timeout:6000},async t=>{
+  const run=temporaryRun(t);fakeGame(run);let held;
+  const endpoint=await model(run,(_req,res)=>{held=res;});
+  const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_REQUESTS:'1'});
+  await boot(processRun);await waitFor(()=>held,()=>processRun.output());
+  fs.mkdirSync(path.join(run.luaDir,'claude_intent.txt.tmp'));
+  reply(held,{action:{type:'WAIT'},memory:'must not be accepted'},{prompt_eval_count:3,eval_count:2});
+  await processRun.exited;const state=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
+  assert.equal(state.telemetry.counters.responses,1);assert.equal(state.telemetry.counters.publicationFailures,1);
+  assert.equal(state.telemetry.counters.intentsPublished,0);assert.equal(state.seq,0);
+  assert.equal(state.memory,'(fresh mind — nothing yet)');assert.equal(state.telemetry.usage.inputTokens.tokens,3);
+});
+
+test('diagnostic failure after publication cannot report an unwritten command',{timeout:6000},async t=>{
+  const run=temporaryRun(t);const game=fakeGame(run);
+  const endpoint=await model(run,(_req,res)=>reply(res,{action:{type:'WAIT'},memory:'published memory'}));
+  const preload=`import {RunTelemetry} from ${JSON.stringify(new URL('../telemetry.mjs',import.meta.url).href)};
+    RunTelemetry.prototype.publishIntent=()=>{throw new Error('synthetic diagnostic failure');};`;
+  const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_REQUESTS:'1'},
+    ['--import',`data:text/javascript,${encodeURIComponent(preload)}`]);
+  await processRun.exited;const state=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));
+  assert.equal(state.seq,1);assert.equal(game.state.lastSeq,1);assert.equal(state.memory,'published memory');
+  assert.equal(state.telemetry.publicationAccountingComplete,false);
+  assert.equal(state.telemetry.counters.publicationFailures,0);
+  assert.match(processRun.output(),/Publication accounting incomplete; command file was written/);
+  assert.doesNotMatch(processRun.output(),/intent_write_failed/);
+});
+
+test('HTTP failure has sanitized diagnostic metadata and unknown usage',{timeout:6000},async t=>{
+  const run=temporaryRun(t);fakeGame(run);
+  const endpoint=await model(run,(_req,res)=>{res.writeHead(429,{'x-request-id':'fixture-request-429',connection:'close'});res.end('private-provider-fixture-body');});
+  const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_REQUESTS:'1'});await processRun.exited;
+  const state=JSON.parse(fs.readFileSync(run.stateFile,'utf8'));const telemetry=state.telemetry;
+  assert.equal(telemetry.counters.attempts,1);assert.equal(telemetry.counters.responses,0);
+  assert.equal(telemetry.counters.providerFailures,1);assert.equal(telemetry.counters.invalidDecisions,0);
+  assert.equal(telemetry.recentAttempts[0].metadata.httpStatus,429);
+  assert.equal(telemetry.recentAttempts[0].metadata.requestId,'fixture-request-429');
+  assert.equal(telemetry.usage.totalTokens.tokens,null);
+  assert.doesNotMatch(processRun.output()+JSON.stringify(state),/private-provider-fixture-body/);
+});
+
+test('saved accounting and startup receipts are not attributed to a new bridge run',{timeout:6000},async t=>{
+  const run=temporaryRun(t);fakeGame(run,{actionOutcome:{world:'fixture-world',actor:'0',session:'fixture-session',seq:99,action:'EAT',status:'observed_effect',hungerDrop:0.2}});
+  fs.writeFileSync(run.stateFile,JSON.stringify({seq:100,telemetry:{runId:'previous-run',counters:{attempts:999,responses:999,observedEffects:999}}}));
+  const endpoint=await model(run,(_req,res)=>reply(res));
+  const processRun=startBridge(run,{OLLAMA_URL:endpoint.url,PZ_MAX_REQUESTS:'1'});await processRun.exited;
+  const telemetry=JSON.parse(fs.readFileSync(run.stateFile,'utf8')).telemetry;
+  assert.notEqual(telemetry.runId,'previous-run');assert.equal(telemetry.counters.attempts,1);
+  assert.equal(telemetry.counters.responses,1);assert.equal(telemetry.counters.intentsPublished,1);
+  assert.equal(telemetry.counters.matchedReceipts,0);assert.equal(telemetry.counters.observedEffects,0);
+  assert.equal(telemetry.unresolvedTracked,1);assert.equal(telemetry.usage.inputTokens.tokens,null);
 });
 
 test('missing, unknown, or malformed actions are refused without an intent or accepted memory',{timeout:6000,concurrency:true},async t=>{
@@ -355,6 +434,8 @@ test('dashboard exposes session limits and accepts only same-origin POST stop',{
   renderState.percept.water={valid:false,sources:[{}],fillableVessels:[]};
   renderState.percept.actionOutcome={action:'DRINKTAP',phase:'verify',status:'unverified',detail:payload};
   renderState.chat.push({from:'claude',text:payload,t:'<svg/onload=stopAI()>'});
+  renderState.telemetry.config.requestedModel=payload;
+  renderState.telemetry.recentAttempts=[{metadata:{returnedModel:payload,requestId:payload,responseId:payload,httpStatus:200,latencyMs:42}}];
   const elements=new Map();
   const document={getElementById(id){if(!elements.has(id))elements.set(id,{});return elements.get(id);}};
   const script=html.match(/<script>([\s\S]*?)<\/script>/);assert.ok(script);
@@ -365,6 +446,10 @@ test('dashboard exposes session limits and accepts only same-origin POST stop',{
   assert.equal(rendered.includes('<img'),false);assert.equal(rendered.includes('<svg'),false);
   assert.ok(rendered.includes('&lt;img src=x onerror=&quot;stopAI()&quot;&gt; &amp; &#39;quoted&#39;'));
   assert.ok(rendered.includes('&lt;svg/onload=stopAI()&gt;'));
+  for(const id of ['provider','model-response']){assert.equal(elements.get(id).innerHTML,undefined);assert.ok(elements.get(id).textContent.includes(payload));}
+  assert.match(elements.get('activity').textContent,/Attempts 1.*responses 0.*commands published 0.*observed effects 0/);
+  assert.match(elements.get('usage').textContent,/input: unknown.*0\/0 responses/);
+  assert.match(elements.get('session').textContent,/model attempts/);
   assert.match(elements.get('health').textContent,/Body check: incomplete.*known bleeding: 1.*unknown parts: 2/);
   assert.equal(elements.get('water').innerHTML,undefined);
   assert.ok(elements.get('water').textContent.includes(payload));
@@ -483,7 +568,7 @@ test('continuous play crosses former request and duration caps, then dashboard s
   const html=await(await fetch(`${base}/mind`)).text();const script=html.match(/<script>([\s\S]*?)<\/script>/);assert.ok(script);
   const elements=new Map();const document={getElementById(id){if(!elements.has(id))elements.set(id,{});return elements.get(id);}};
   await runInNewContext(script[1],{document,fetch:async()=>({json:async()=>state}),setInterval:()=>0});
-  assert.match(elements.get('session').textContent,/continuous.*305 decisions.*until stopped/);
+  assert.match(elements.get('session').textContent,/continuous.*305 model attempts.*until stopped/);
   const before=fs.readFileSync(path.join(run.luaDir,'claude_intent.txt'),'utf8');
   const stopped=await fetch(`${base}/control/stop`,{method:'POST',headers:{Origin:base}});assert.equal(stopped.status,202);
   // Resolve the pending provider reply after the explicit stop: its new state

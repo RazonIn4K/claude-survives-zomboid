@@ -9,9 +9,10 @@
 
 import http from 'node:http';
 import fs from 'node:fs';
-import { callLLM, BACKEND, MODEL } from './llm.mjs';
+import { callLLMResult, publicModelConfig } from './llm.mjs';
 import { loadBridgeConfig } from './config.mjs';
 import { LabRun, labConfig } from './lab.mjs';
+import { RunTelemetry } from './telemetry.mjs';
 
 let config, runConfig;
 try {
@@ -24,7 +25,11 @@ try {
 const { host: HOST, port: PORT, perceptFile: PERCEPT_FILE,
   intentFile: INTENT_FILE, controlFile: CONTROL_FILE, stateFile: STATE_FILE } = config;
 const lab = new LabRun(runConfig);
+// Process-local accounting is never restored from the model's saved memory.
+const telemetry = new RunTelemetry({ config: publicModelConfig() });
 let closing = false, server, loopTimer, lastBoundArmed = false, baselineHealth = null;
+let publicationAccountingComplete = true;
+const telemetrySnapshot = () => ({ ...telemetry.snapshot(), publicationAccountingComplete });
 
 // atomic write so the game never getFileReader's a half-written line
 function atomicWrite(file, line) {
@@ -41,7 +46,7 @@ let state = {
   chat: [],                // two-way GOD channel: {from:'god'|'claude', text, t}
 };
 try { state = { ...state, ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) }; } catch {}
-const saveState = () => { try { fs.writeFileSync(STATE_FILE, JSON.stringify({ ...state, lab: lab.snapshot(), run: sessionInfo(), log: state.log.slice(-200) })); } catch {} };
+const saveState = () => { try { fs.writeFileSync(STATE_FILE, JSON.stringify({ ...state, lab: lab.snapshot(), run: sessionInfo(), telemetry: telemetrySnapshot(), log: state.log.slice(-200) })); } catch {} };
 
 let percept = null;         // last parsed percept
 let perceptAt = 0;          // percept file modification time, capped at the current time
@@ -124,6 +129,9 @@ function readPercept() {
     // Archived facts are never restored as live knowledge or fed back to Lua.
     state.navigation = j.navigation ?? null;
     const outcome = j.actionOutcome;
+    // Only exact, first terminal receipts for this process's published commands
+    // contribute to progress counts. Historical observations remain separate.
+    if (telemetry.observeOutcome(outcome)) saveState();
     if (outcome && outcome.status !== 'pending' && Number.isSafeInteger(outcome.seq)) {
       const key = JSON.stringify([outcome.world, outcome.actor, outcome.session, outcome.seq, outcome.action, outcome.status]);
       if (key !== lastOutcomeKey) {
@@ -201,13 +209,12 @@ process.on('SIGINT', () => { void finishRun('signal_stop'); });
 process.on('SIGTERM', () => { void finishRun('signal_stop'); });
 
 // ---------- LLM backend (Ollama / Anthropic / OpenAI / Gemini / Claude CLI) ----------
-// The actual provider dispatch lives in llm.mjs; ccCall is a thin alias so the rest of the
-// bridge is backend-agnostic.
-const ccCall = callLLM;
+// Provider metadata is recorded before interpreting any generated decision.
 function grabJSON(s) {
   const m = s.match(/\{[\s\S]*\}/);
   if (!m) throw new Error('no JSON in reply');
-  return JSON.parse(m[0]);
+  try { return JSON.parse(m[0]); }
+  catch { throw new Error('invalid decision JSON'); } // Native parse errors can echo reply content.
 }
 
 // ---------- the mind ----------
@@ -294,19 +301,22 @@ async function decide() {
   if (percept.qlen > 0) { brainNote = 'waiting for the current timed action queue'; return; }
   if (percept.actionOutcome?.status === 'pending') { brainNote = `waiting for action evidence (${percept.actionOutcome.phase || 'observe'})`; return; }
   if (!lab.beginRequest(percept)) { if (lab.stopped) void finishRun(lab.reason); return; }
+  const attemptId = telemetry.beginAttempt();
 
   inFlight = true;
   brainNote = 'thinking…';
   const decisionPerceptAt = perceptAt;
   const decisionSource = perceptSource;
   const god = godQueue.splice(0);
-  const discard = reason => {
+  const discard = (reason, code) => {
+    telemetry.rejectDecision(attemptId, code, 'discarded');
     brainNote = `discarded model reply: ${reason}`;
     log('discard', reason);
     // Unanswered guidance belongs to the next decision that is actually accepted.
     godQueue.unshift(...god);
     if (godQueue.length > 40) godQueue.splice(0, godQueue.length - 40);
   };
+  saveState(); // An interrupted in-flight request remains unknown, not zero usage.
   // Keep this SHORT — prompt length is the dominant latency cost. Your `memory` field is the
   // real continuity; the log is just the last few beats so you don't repeat yourself.
   const recent = state.log.filter(l => l.kind === 'decide' || l.kind === 'god' || l.kind === 'death').slice(-3)
@@ -325,25 +335,30 @@ CURRENT SENSES: ${JSON.stringify(publicPercept())}
 
 Advance your subtask toward your goal. STRICT JSON only.`;
 
+  let decisionStage = 'model';
   try {
-    const out = grabJSON(await ccCall(prompt)); // Exactly one provider call per counted attempt.
-    if (closing) return;
+    const response = await callLLMResult(prompt); // Exactly one adapter invocation per attempt.
+    telemetry.recordResponse(attemptId, response.metadata);
+    decisionStage = 'parse';
+    if (closing) { discard('controller is stopping', 'controller_stopping'); return; }
+    const out = grabJSON(response.text);
     // Inference may outlive the senses it used. Refresh from
     // disk, not merely the one-second polling cache, before changing intent or memory.
     const decisionAge = Date.now() - decisionPerceptAt;
     if (decisionAge > MAX_PERCEPT_AGE_MS || decisionAge < -1000) {
-      discard('request percept expired during inference'); return;
+      discard('request percept expired during inference', 'stale_percept'); return;
     }
-    if (!readPercept()) { discard('current percept is unreadable or stale'); return; }
-    if (percept.dead) { discard('survivor is dead'); return; }
-    if (!lab.ready(percept)) { discard('lab session was revoked, changed, or expired'); return; }
+    if (!readPercept()) { discard('current percept is unreadable or stale', 'unreadable_percept'); return; }
+    if (percept.dead) { discard('survivor is dead', 'survivor_dead'); return; }
+    if (!lab.ready(percept)) { discard('lab session was revoked, changed, or expired', 'session_changed'); return; }
     const stopReason = autonomousStopReason(percept);
-    if (stopReason) { await finishRun(stopReason); return; }
-    if (percept.qlen !== 0 || percept.nativeBusy !== false) { discard('body became busy during inference'); return; }
-    if (percept.actionOutcome?.status === 'pending') { discard('an action outcome became pending during inference'); return; }
+    if (stopReason) { discard(stopReason, 'survivor_guard'); await finishRun(stopReason); return; }
+    if (percept.qlen !== 0 || percept.nativeBusy !== false) { discard('body became busy during inference', 'body_busy'); return; }
+    if (percept.actionOutcome?.status === 'pending') { discard('an action outcome became pending during inference', 'pending_outcome'); return; }
     if (perceptSource.dev !== decisionSource.dev || perceptSource.ino !== decisionSource.ino) {
-      discard('percept file was replaced during inference'); return;
+      discard('percept file was replaced during inference', 'percept_replaced'); return;
     }
+    decisionStage = 'action';
     const a = out.action;
     if (!a || typeof a !== 'object' || Array.isArray(a) || typeof a.type !== 'string'
       || !['MOVE', 'NAVIGATE', 'LOOT', 'EAT', 'DRINK', 'DRINKTAP', 'FILLBOTTLE', 'BANDAGE', 'EQUIP', 'CLOSEDOOR', 'CONCEAL', 'BREAKIN', 'STOP', 'WAIT'].includes(a.type)) {
@@ -355,8 +370,19 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     const thoughtField = String(out.thought || '').replace(/[|\r\n]/g, ' ').slice(0, 200);
     const goalCandidate = String(out.subtask || out.goal || state.subtask || state.goal || '').trim().slice(0, 90);
     const nextSeq = Math.max(state.seq, Number(percept.lastSeq) || 0) + 1;
+    decisionStage = 'intent';
     const wire = lab.intent(percept, nextSeq, { type, dx, dy, targetId }, say, thoughtField, goalCandidate);
+    decisionStage = 'publish';
     writeIntentFile(wire); // Do not accept model-authored state if publication fails.
+    decisionStage = 'published';
+    state.seq = nextSeq;
+    intentLine = wire;
+    try {
+      if (!telemetry.publishIntent(attemptId, { ...lab.target, seq: nextSeq, action: type })) {
+        publicationAccountingComplete = false;
+      }
+    } catch { publicationAccountingComplete = false; }
+    if (!publicationAccountingComplete) log('diagnostic', 'Publication accounting incomplete; command file was written.');
     if (god.length && reply) {
       state.chat.push({ from: 'claude', text: reply, t: new Date().toISOString().slice(11, 19) });
       state.chat = state.chat.slice(-40);
@@ -364,8 +390,6 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     }
     if (out.goal && String(out.goal).trim()) state.goal = String(out.goal).trim().slice(0, 200);
     if (out.subtask && String(out.subtask).trim()) state.subtask = String(out.subtask).trim().slice(0, 120);
-    state.seq = nextSeq;
-    intentLine = wire;
     lastThought = String(out.thought || '').slice(0, 500);
     lastAction = type === 'MOVE' ? `MOVE ${dx},${dy}` : (type === 'NAVIGATE' ? `NAVIGATE ${targetId}` : type);
     if (out.memory) state.memory = String(out.memory).slice(0, 600);
@@ -373,10 +397,18 @@ Advance your subtask toward your goal. STRICT JSON only.`;
     log('decide', `[${state.subtask}] ${lastAction}${say ? ` · "${say}"` : ''} — ${lastThought}`);
     saveState();
   } catch (e) {
-    brainNote = `brain error: ${e.message} (attempt counted; no hidden retry)`;
-    log('error', e.message);
+    // Fixed local labels keep provider bodies, malformed replies and raw
+    // exception objects out of the diagnostic ledger and dashboard error log.
+    const reason = ({ model: 'model_call_failed', parse: 'invalid_json', action: 'unsupported_action',
+      intent: 'intent_rejected', publish: 'intent_write_failed', published: 'post_publication_error' })[decisionStage];
+    if (decisionStage === 'model') telemetry.recordFailure(attemptId, e.metadata, e.code);
+    else if (decisionStage !== 'published') telemetry.rejectDecision(attemptId, reason,
+      decisionStage === 'publish' ? 'publication_failed' : 'invalid');
+    brainNote = `brain error: ${reason} (attempt counted; no hidden retry)`;
+    log('error', reason);
   } finally {
     inFlight = false;
+    saveState();
     if (!closing && lab.stopped) { await finishRun(lab.reason); }
     if (!closing && runConfig.maxRequests !== null && lab.requests >= runConfig.maxRequests) {
       // Give the final accepted command a bounded opportunity to be consumed and
@@ -416,7 +448,17 @@ input{width:70%;background:#151b22;border:1px solid #26303a;color:#dde3ea;paddin
 <h1>Claude survives — Project Zomboid</h1>
 <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><span class="note" id="session"></span><button id="stop-ai" hidden onclick="stopAI()" style="background:#e88787">Stop AI</button></div>
 <div class="note" id="note"></div>
-<div class="bubble" id="goal" style="border-left-color:#ffd479"><b style="color:#8899aa;font-size:11px;text-transform:uppercase;display:block">Goal</b><span id="goaltext"></span><div class="note" id="subtask" style="margin-top:4px"></div></div>
+<section class="bubble" aria-label="AI activity this bridge run">
+<b>AI activity — this bridge run</b>
+<div class="note" id="provider"></div>
+<div id="activity"></div>
+<div class="note" id="usage"></div>
+<div class="note" id="model-response"></div>
+<div class="note" id="game-results"></div>
+<div class="note">A published command is an attempt to act. Game receipts report observed effects or arrival; they do not establish general survival competence. Token counts are provider reports, not verified charges or quota.</div>
+</section>
+<div class="bubble" id="goal" style="border-left-color:#ffd479"><b style="color:#8899aa;font-size:11px;text-transform:uppercase;display:block">Model's proposed goal</b><span id="goaltext"></span><div class="note" id="subtask" style="margin-top:4px"></div></div>
+<div class="note">Model commentary — check game results for evidence of progress.</div>
 <div class="bubble" id="thought"></div>
 <div class="bubble say" id="say"></div>
 <div class="grid" id="stats"></div>
@@ -434,7 +476,15 @@ function escapeHTML(value){return String(value??'').replace(/[&<>"']/g,character
 function bar(label,v,inv){const pct=Math.round(v*100);const dang=(inv?v>0.7:v<0.3)?' danger':'';
 return '<div class="stat"><b>'+label+'</b>'+(inv?pct+'%':Math.round(v))+'<div class="bar'+dang+'"><i style="width:'+Math.min(100,pct)+'%"></i></div></div>'}
 async function tick(){try{const r=await fetch('/api/state');const s=await r.json();
-const run=s.run;document.getElementById('session').textContent=run.mode+' · '+run.status+' · '+(run.maxRequests===null?run.requests+' decisions · until stopped':run.requests+'/'+run.maxRequests+' decisions · '+Math.ceil(run.remainingSeconds/60)+' min remaining');
+const run=s.run;document.getElementById('session').textContent=run.mode+' · '+run.status+' · '+(run.maxRequests===null?run.requests+' model attempts · until stopped':run.requests+'/'+run.maxRequests+' model attempts · '+Math.ceil(run.remainingSeconds/60)+' min remaining');
+const telemetry=s.telemetry;const counts=telemetry?.counters;const config=telemetry?.config;
+document.getElementById('provider').textContent=config?'Configured adapter: '+String(config.backend||'unknown')+' · endpoint origin: '+String(config.endpointOrigin||'unavailable')+' · authentication: '+String(config.authMode||'unknown')+' · requested model: '+String(config.requestedModel||'unavailable')+'. The adapter does not verify the upstream billing account.':'Provider details unavailable';
+document.getElementById('activity').textContent=counts?(telemetry.publicationAccountingComplete===false?'Incomplete publication accounting — counts may underreport. ':'')+'Attempts '+counts.attempts+' · responses '+counts.responses+' · commands published '+counts.intentsPublished+' · matched game receipts '+counts.matchedReceipts+' · observed effects '+counts.observedEffects+' · arrivals '+counts.arrivals:'Activity unavailable';
+const usage=telemetry?.usage;const tokenText=(field,label)=>{const item=usage?.[field];return label+': '+(item?.tokens===null||item?.tokens===undefined?'unknown':String(item.tokens))+' ('+(item?.reportedResponses||0)+'/'+(counts?.responses||0)+' responses report this field'+(item?.overflowed?', subtotal overflow':'')+')';};
+document.getElementById('usage').textContent='Reported token subtotals — '+tokenText('inputTokens','input')+' · '+tokenText('outputTokens','output')+' · '+tokenText('totalTokens','total')+'. Missing fields stay unknown; failures and unfinished requests may also have consumed usage.';
+const lastResponse=[...(telemetry?.recentAttempts||[])].reverse().find(item=>item.metadata);const meta=lastResponse?.metadata;
+document.getElementById('model-response').textContent=meta?'Latest attempt diagnostics: '+String(lastResponse.status||'unknown')+' / '+String(lastResponse.errorCode||lastResponse.disposition||'awaiting decision')+' · model '+String(meta.returnedModel||'unavailable')+' · HTTP '+String(meta.httpStatus??'unavailable')+' · '+String(meta.latencyMs??'unknown')+' ms · request ID '+String(meta.requestId||'unavailable')+' · response ID '+String(meta.responseId||'unavailable')+' · reported input/output/total tokens '+['inputTokens','outputTokens','totalTokens'].map(field=>String(meta.usage?.[field]??'unknown')).join('/')+'. Failed attempts are excluded from response subtotals. Returned model is provider-reported, not independently attested.':'No completed attempt diagnostics yet.';
+document.getElementById('game-results').textContent=counts?'Model failures '+counts.providerFailures+' · invalid decisions '+counts.invalidDecisions+' · discarded replies '+counts.discardedDecisions+' · publication failures '+counts.publicationFailures+' · tracked commands without terminal receipt '+telemetry.unresolvedTracked+'. Receipt statuses: '+Object.entries(telemetry.receiptStatuses||{}).map(([status,count])=>status+' '+count).join(', ')+'. Recent records are bounded; '+telemetry.correlationsEvicted+' command correlations evicted. Counters reset when the bridge restarts.':'';
 const stop=document.getElementById('stop-ai');stop.hidden=!run.armedOptIn;stop.disabled=run.status==='stopping';
 document.getElementById('note').textContent='brain: '+s.brainNote+' · action: '+s.lastAction+' · seq '+s.seq+(s.percept?' · day '+s.percept.day+' '+String(s.percept.hour).padStart(2,'0')+':00 · '+s.percept.room:'');
 document.getElementById('goaltext').textContent=s.goal||'(setting a goal…)';
@@ -500,7 +550,7 @@ server = http.createServer((req, res) => {
   if (u.pathname === '/api/state') {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     return res.end(JSON.stringify({
-      lab: lab.snapshot(), run: sessionInfo(), percept: publicPercept(), perceptFresh: Date.now() - perceptAt < 5000, seq: state.seq,
+      lab: lab.snapshot(), run: sessionInfo(), telemetry: telemetrySnapshot(), percept: publicPercept(), perceptFresh: Date.now() - perceptAt < 5000, seq: state.seq,
       lastThought, lastSay: (intentLine.split('|')[4] || ''), lastAction, brainNote,
       goal: state.goal, subtask: state.subtask, chat: state.chat.slice(-24),
       memory: state.memory, log: state.log.slice(-60),
@@ -513,7 +563,8 @@ server = http.createServer((req, res) => {
   res.writeHead(404); res.end();
 }).listen(PORT, HOST, function () {
   const address = this.address();
-  log('boot', `pz-bridge up on http://${address.address}:${address.port}/mind — brain: ${BACKEND} (${MODEL}) — percept from ${PERCEPT_FILE}`);
+  const modelConfig = publicModelConfig();
+  log('boot', `pz-bridge up on http://${address.address}:${address.port}/mind — brain: ${modelConfig.backend} (${modelConfig.requestedModel || 'unavailable'}) — percept from ${PERCEPT_FILE}`);
   readPercept();
   heartbeat();
 });

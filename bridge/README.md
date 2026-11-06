@@ -285,6 +285,53 @@ Relative override paths resolve from the directory where you launch Node. Use ab
 
 Separation checks resolve directory/file symlinks and detect existing hardlinks. IPC filenames are reserved without regard to case inside the same resolved directory, even before those files exist. Dangling symlinks are rejected. These startup checks prevent accidental aliases; they do not protect against another process changing filesystem links after validation.
 
+## Model activity and observed progress
+
+The dashboard and `/api/state` expose `telemetry` for the **current bridge
+process**. Its saved snapshot is evidence of that run, not restored accounting
+on the next launch. Model memory and the historical game-outcome archive remain
+separate. The display distinguishes model commentary from observed progress.
+
+- Attempts count adapter invocations, including configuration failures before
+  network access. Responses count successfully decoded adapter results, even
+  if their generated decision is later invalid or discarded.
+- Commands count only after validation and successful atomic publication.
+  Publication and the game's sequence acknowledgment do not prove execution.
+- Matched game receipts require the exact published world, actor, control
+  session, sequence and action. Each tracked command contributes at most one
+  terminal receipt. `observed_effect`, `arrived`, `no_effect`, `unverified`,
+  `interrupted` and `native_failed` remain distinct. No receipt means unknown.
+- The ledger retains at most 100 recent attempts and command correlations.
+  Aggregate counts continue for the process, but receipts for evicted commands
+  are not counted. The dashboard exposes that retention boundary.
+
+`callLLMResult(prompt)` returns text plus allowlisted optional metadata;
+`callLLM(prompt)` still returns just text with one adapter call. Reported usage
+is captured before decision parsing. Missing or invalid token fields are
+`null`, explicit zeros remain zero, and totals are never synthesized. Aggregates
+are **reported subtotals with response coverage**, not complete account usage.
+Failed and unfinished requests may have consumed usage too.
+If usable usage fields arrive before unsupported response text causes an
+adapter failure, those fields remain in that attempt's diagnostics. Failed
+attempts are excluded from the explicitly labeled response subtotals.
+An internal publication-accounting failure is marked incomplete; it does not
+undo the published command or misreport the command-file write as failed.
+
+The configured adapter, endpoint origin and authentication mode do not identify
+an upstream billing account. An OpenAI-compatible local gateway need not use an
+OpenAI key. Returned model names are provider-reported, not independently
+attested. Request-header IDs and response-body IDs are kept separate. No price,
+charge or quota is inferred; Zen development calls are outside this ledger.
+Provider bodies, raw error messages, prompts, arbitrary headers and URL
+credentials/query/path are not included in these new diagnostic records.
+
+Mappings use [OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
+[Anthropic Messages](https://platform.claude.com/docs/en/build-with-claude/working-with-messages),
+[Ollama chat](https://docs.ollama.com/api/chat) and
+[Gemini GenerateContent](https://ai.google.dev/api/generate-content).
+Provider category meanings differ; cache/reasoning counts are not added again.
+CLI mode does not report token usage.
+
 ## Delayed decisions
 
 The bridge uses the percept file's modification time, not the time Node reads
